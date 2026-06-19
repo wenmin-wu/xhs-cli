@@ -378,12 +378,15 @@ def whoami(as_json: bool):
 
 @cli.command()
 @click.argument("keyword")
+@click.option("--sort", type=click.Choice(["general", "time", "popular"]),
+              default="general",
+              help="Sort: general (default), time (newest first), popular (most-liked)")
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON")
-def search(keyword: str, as_json: bool):
+def search(keyword: str, sort: str, as_json: bool):
     """Search notes by keyword."""
     try:
         with _get_client() as client:
-            feeds = client.search_notes(keyword)
+            feeds = client.search_notes(keyword, sort=sort)
 
             # Cache note_id -> xsec_token mapping so subsequent commands
             # (note, like, favorite, comment) can auto-resolve tokens.
@@ -397,7 +400,7 @@ def search(keyword: str, as_json: bool):
                 console.print("[yellow]No results found.[/yellow]")
                 return
 
-            table = Table(title=f"Search: {keyword} ({len(feeds)} results)")
+            table = Table(title=f"Search: {keyword} ({len(feeds)} results, sort={sort})")
             table.add_column("#", style="dim", width=3)
             table.add_column("Title", style="cyan", max_width=40)
             table.add_column("Author", style="green", max_width=15)

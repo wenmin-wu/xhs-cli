@@ -235,7 +235,7 @@ class XhsClient:
 
     # ===== Search =====
 
-    def search_notes(self, keyword: str, limit: int = 10) -> list[dict]:
+    def search_notes(self, keyword: str, limit: int = 10, sort: str = "general") -> list[dict]:
         """Search notes by keyword, scraping the rendered DOM.
 
         Opens each result card to read its detail, then re-packs the scraped
@@ -244,12 +244,19 @@ class XhsClient:
         """
         import urllib.parse
 
+        # XHS honors a `sort` query param on the web search page (verified live):
+        # general (综合, default) / time_descending (最新) / popularity_descending (最热).
+        sort_map = {"general": "", "time": "time_descending",
+                    "popular": "popularity_descending"}
         url = (
             "https://www.xiaohongshu.com/search_result?keyword="
             + urllib.parse.quote(keyword)
         )
+        sort_val = sort_map.get(sort, "")
+        if sort_val:
+            url += "&sort=" + sort_val
 
-        logger.info("Searching: %s (limit=%d)", keyword, limit)
+        logger.info("Searching: %s (limit=%d, sort=%s)", keyword, limit, sort)
         self._goto(
             url,
             timeout=20000,

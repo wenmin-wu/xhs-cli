@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- Self-heal the Playwright Firefox driver against a crash where a Xiaohongshu
+  page emits an uncaught JS error with no source `location`. The driver did
+  `pageError.location.url` (TypeError → Node process dies mid-session); guarding
+  it then tripped protocol validation (`location.url: expected string, got
+  undefined`). `client.start()` now idempotently patches the vendored
+  `coreBundle.js` to default the `location` fields to valid types (`""` / `0`)
+  before launching camoufox. Best-effort; never blocks startup.
+
 ## v0.1.4 - 2026-03-11
 
 ### Changed

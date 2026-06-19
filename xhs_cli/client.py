@@ -34,6 +34,65 @@ function unwrap(obj, depth) {
 """.strip()
 
 
+def _patch_pageerror(src: str) -> str:
+    """Default Playwright's pageError ``location`` fields to valid types.
+
+    Returns the patched source. Idempotent — safe to run on already-patched
+    input (the ``?? ""`` / ``?? 0`` defaults are matched optionally).
+    """
+    import re
+
+    src = re.sub(
+        r'url:\s*pageError\.location\??\.url(?:\s*\?\?\s*"")?\s*,',
+        'url: pageError.location?.url ?? "",',
+        src,
+    )
+    src = re.sub(
+        r'line:\s*pageError\.location\??\.lineNumber(?:\s*\?\?\s*0)?\s*,',
+        'line: pageError.location?.lineNumber ?? 0,',
+        src,
+    )
+    src = re.sub(
+        r'column:\s*pageError\.location\??\.columnNumber(?:\s*\?\?\s*0)?',
+        'column: pageError.location?.columnNumber ?? 0',
+        src,
+    )
+    return src
+
+
+def _ensure_playwright_patched() -> None:
+    """Self-heal Playwright's Firefox driver so an uncaught page error with no
+    source ``location`` doesn't crash the Node driver mid-session.
+
+    Xiaohongshu pages emit uncaught JS errors whose ``location`` is undefined.
+    Playwright's handler does ``pageError.location.url`` → TypeError; once that's
+    guarded, the protocol validator rejects ``url: undefined`` ("expected
+    string, got undefined"). We default the fields to valid types ("" / 0).
+
+    Best-effort and idempotent: runs before each browser launch, patches the
+    vendored ``coreBundle.js`` in place, and never blocks startup on failure
+    (e.g. a read-only site-packages).
+    """
+    try:
+        import pathlib
+
+        import playwright
+
+        bundle = (
+            pathlib.Path(playwright.__file__).parent
+            / "driver" / "package" / "lib" / "coreBundle.js"
+        )
+        if not bundle.exists():
+            return
+        src = bundle.read_text(encoding="utf-8")
+        patched = _patch_pageerror(src)
+        if patched != src:
+            bundle.write_text(patched, encoding="utf-8")
+            logger.info("Patched Playwright pageError handler (coreBundle.js).")
+    except Exception as e:  # never block browser startup on a patch failure
+        logger.debug("Playwright pageError patch skipped: %s", e)
+
+
 class XhsClient:
     """Camoufox-based Xiaohongshu client.
 
@@ -121,6 +180,10 @@ class XhsClient:
     def start(self):
         """Launch camoufox and inject cookies."""
         from camoufox.sync_api import Camoufox
+
+        # Self-heal the Playwright Firefox driver against the location-less
+        # pageError crash before launching (idempotent, best-effort).
+        _ensure_playwright_patched()
 
         logger.info("Starting camoufox browser...")
         self._camoufox_ctx = Camoufox(headless=True)

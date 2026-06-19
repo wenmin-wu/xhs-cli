@@ -164,15 +164,35 @@ def qrcode_login() -> str:
 
 
 def _browser_assisted_qrcode_login() -> str:
-    """Login via QR code using network responses instead of page DOM heuristics."""
+    """Login via QR code using network responses instead of page DOM heuristics.
+
+    Launches a Playwright Chromium browser (headed by default so the user can
+    scan the on-page QR directly).
+    """
+    import os
     import time
 
-    from camoufox.sync_api import Camoufox
+    from playwright.sync_api import sync_playwright
 
     print("🔑 Starting QR code login...")
 
-    with Camoufox(headless=True) as browser:
-        page = browser.new_page()
+    # Headed by DEFAULT: XHS serves a limited/guest page to headless automation,
+    # so a confirmed QR scan from a headless browser still yields a guest session.
+    # Only a visible browser mints a real session. Set XHS_HEADLESS=1 to force
+    # headless (not recommended). XHS_PROXY optionally tunnels the traffic.
+    _headless = os.environ.get("XHS_HEADLESS", "").strip().lower() in ("1", "true", "yes")
+    launch_opts: dict = {"headless": _headless}
+    if not _headless:
+        logger.info("Login headed (visible window)")
+    _proxy = os.environ.get("XHS_PROXY", "").strip()
+    if _proxy:
+        launch_opts["proxy"] = {"server": _proxy}
+        logger.info("Login via proxy %s", _proxy)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(**launch_opts)
+        context = browser.new_context()
+        page = context.new_page()
         state = {"last_status": -1}
 
         def _handle_response(response) -> None:
@@ -206,17 +226,23 @@ def _browser_assisted_qrcode_login() -> str:
             ) as qr_response_info:
                 page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=20_000)
         except Exception as exc:
-            raise LoginError("Failed to load Xiaohongshu login page in Camoufox.") from exc
+            raise LoginError("Failed to load Xiaohongshu login page in Chromium.") from exc
 
         qr_payload = _browser_response_payload(qr_response_info.value)
         qr_url = str(qr_payload.get("url", "")).strip()
         if not qr_url:
             raise LoginError(f"QR login did not expose a QR URL: {qr_payload}")
 
-        print("\n📱 Scan the QR code below with the Xiaohongshu app:\n")
-        if not _display_qr_text_in_terminal(qr_url):
-            print(f"QR URL: {qr_url}")
-        print("\n⏳ Waiting for QR code scan...")
+        if not _headless:
+            # The visible browser already shows a crisp, scannable QR — no point
+            # rendering a (often garbled) ASCII QR in the terminal.
+            print("\n📱 A browser window is open — scan the on-page QR with the "
+                  "Xiaohongshu app, or use phone-number login, directly in it.")
+        else:
+            print("\n📱 Scan the QR code below with the Xiaohongshu app:\n")
+            if not _display_qr_text_in_terminal(qr_url):
+                print(f"QR URL: {qr_url}")
+        print("\n⏳ Waiting for login...")
 
         try:
             with page.expect_response(
@@ -256,7 +282,14 @@ def _browser_assisted_qrcode_login() -> str:
 
         cookie_str = _dict_to_cookie_str(cookies)
         save_cookies(cookie_str)
+        try:
+            context.close()
+            browser.close()
+        except Exception:
+            pass
         return cookie_str
+
+
 def _normalize_browser_cookies(raw_cookies: list[dict[str, Any]]) -> dict[str, str]:
     """Convert browser cookies into the local persisted cookie shape."""
     cookies: dict[str, str] = {}

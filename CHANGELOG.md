@@ -4,15 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
-### Fixed
+### Changed
 
-- Self-heal the Playwright Firefox driver against a crash where a Xiaohongshu
-  page emits an uncaught JS error with no source `location`. The driver did
-  `pageError.location.url` (TypeError → Node process dies mid-session); guarding
-  it then tripped protocol validation (`location.url: expected string, got
-  undefined`). `client.start()` now idempotently patches the vendored
-  `coreBundle.js` to default the `location` fields to valid types (`""` / `0`)
-  before launching camoufox. Best-effort; never blocks startup.
+- **Switched the browser backend from camoufox to Playwright Chromium and
+  rewrote data extraction to DOM scraping** (ported from the proven RedNote-MCP
+  approach). Modern Xiaohongshu no longer populates
+  `window.__INITIAL_STATE__.search.feeds` / `.feed.feeds`, so the old JS-state
+  extraction timed out on every command. `search`/`read`/`comments`/`feed` now
+  scrape the rendered DOM (`.feeds-container .note-item`, `#noteContainer`,
+  `.note-container`, etc.). Public method signatures and CLI output shapes are
+  unchanged. Run `playwright install chromium` once. Chromium also renders CJK
+  correctly (camoufox's Firefox showed garbled Chinese) and is ~150 MB vs
+  camoufox's ~712 MB. This supersedes the earlier camoufox `coreBundle.js`
+  self-heal (the Firefox-driver crash doesn't exist on Chromium).
+- **Headed by default.** XHS serves a limited/guest page to headless automation,
+  so only a visible browser mints a real session and returns real feeds. Set
+  `XHS_HEADLESS=1` to force headless (not recommended). The login also skips the
+  terminal ASCII QR in headed mode — scan the crisp on-page QR in the window.
+- Added `XHS_PROXY` (route the browser through a SOCKS5/HTTP proxy) and
+  `XHS_TIMEOUT` (override the default 30s data/selector wait, in seconds).
+- The post-login usability probe now uses a lightweight login-status check (the
+  `我` sidebar link) instead of loading a feed, so a confirmed login is no longer
+  falsely discarded as "limited" when a feed is slow to render.
 
 ## v0.1.4 - 2026-03-11
 

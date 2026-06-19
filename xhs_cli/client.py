@@ -1,12 +1,20 @@
-"""Xiaohongshu browser-based client using camoufox.
+"""Xiaohongshu browser-based client using Playwright Chromium + DOM scraping.
 
-All operations navigate to pages and extract data from window.__INITIAL_STATE__,
-exactly like a real user browsing. This avoids API-level risk control (300011).
+Ported from the proven RedNote-MCP approach: launch a real (headed by default)
+Chromium, navigate to pages, and scrape the *rendered DOM* with stable CSS
+selectors. Modern Xiaohongshu no longer populates ``window.__INITIAL_STATE__``
+with the search/feed feeds, so DOM scraping is the reliable path.
+
+Each data method keeps its original signature and *return shape* so that
+``cli.py`` continues to format output unchanged: scraped flat values are
+re-packed into the nested ``note_card`` / ``interactInfo`` dicts that the CLI
+already knows how to read.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import random
 import re
 import time
@@ -15,100 +23,60 @@ from .exceptions import DataFetchError, LoginError
 
 logger = logging.getLogger(__name__)
 
-# Shared JavaScript function to unwrap Vue reactive refs from __INITIAL_STATE__.
-# Vue wraps values in reactive Proxy objects with _value/dep structure.
-UNWRAP_JS = """
-function unwrap(obj, depth) {
-    if (depth > 6 || obj === null || obj === undefined) return obj;
-    if (typeof obj !== 'object') return obj;
-    if ('_value' in obj && 'dep' in obj) return unwrap(obj._value, depth + 1);
-    if ('value' in obj && 'dep' in obj) return unwrap(obj.value, depth + 1);
-    if (Array.isArray(obj)) return obj.map(item => unwrap(item, depth + 1));
-    const result = {};
-    for (const key of Object.keys(obj)) {
-        if (key === 'dep' || key.startsWith('__')) continue;
-        try { result[key] = unwrap(obj[key], depth + 1); } catch(e) {}
-    }
-    return result;
-}
-""".strip()
+# Login-status probe used by RedNote-MCP: the sidebar "我" (Me) channel link is
+# only rendered when logged in.
+LOGIN_CHECK_JS = """() => {
+    const el = document.querySelector('.user.side-bar-component .channel');
+    return !!(el && el.textContent && el.textContent.trim() === '我');
+}"""
+
+# Default data/selector timeout in ms (RedNote-MCP uses 30000). Overridable via
+# XHS_TIMEOUT (seconds).
+DEFAULT_TIMEOUT_S = 30.0
 
 
-def _patch_pageerror(src: str) -> str:
-    """Default Playwright's pageError ``location`` fields to valid types.
+def _chinese_unit_to_number(text: str) -> int:
+    """Convert a count string like '1.2万' / '3,456' / '赞' into an int.
 
-    Returns the patched source. Idempotent — safe to run on already-patched
-    input (the ``?? ""`` / ``?? 0`` defaults are matched optionally).
+    Mirrors RedNote-MCP's ChineseUnitStrToNumber: '万' → ×10000. Non-numeric
+    text (e.g. a bare label) returns 0.
     """
-    import re
-
-    src = re.sub(
-        r'url:\s*pageError\.location\??\.url(?:\s*\?\?\s*"")?\s*,',
-        'url: pageError.location?.url ?? "",',
-        src,
-    )
-    src = re.sub(
-        r'line:\s*pageError\.location\??\.lineNumber(?:\s*\?\?\s*0)?\s*,',
-        'line: pageError.location?.lineNumber ?? 0,',
-        src,
-    )
-    src = re.sub(
-        r'column:\s*pageError\.location\??\.columnNumber(?:\s*\?\?\s*0)?',
-        'column: pageError.location?.columnNumber ?? 0',
-        src,
-    )
-    return src
-
-
-def _ensure_playwright_patched() -> None:
-    """Self-heal Playwright's Firefox driver so an uncaught page error with no
-    source ``location`` doesn't crash the Node driver mid-session.
-
-    Xiaohongshu pages emit uncaught JS errors whose ``location`` is undefined.
-    Playwright's handler does ``pageError.location.url`` → TypeError; once that's
-    guarded, the protocol validator rejects ``url: undefined`` ("expected
-    string, got undefined"). We default the fields to valid types ("" / 0).
-
-    Best-effort and idempotent: runs before each browser launch, patches the
-    vendored ``coreBundle.js`` in place, and never blocks startup on failure
-    (e.g. a read-only site-packages).
-    """
+    if text is None:
+        return 0
+    s = str(text).strip()
+    if not s:
+        return 0
     try:
-        import pathlib
-
-        import playwright
-
-        bundle = (
-            pathlib.Path(playwright.__file__).parent
-            / "driver" / "package" / "lib" / "coreBundle.js"
-        )
-        if not bundle.exists():
-            return
-        src = bundle.read_text(encoding="utf-8")
-        patched = _patch_pageerror(src)
-        if patched != src:
-            bundle.write_text(patched, encoding="utf-8")
-            logger.info("Patched Playwright pageError handler (coreBundle.js).")
-    except Exception as e:  # never block browser startup on a patch failure
-        logger.debug("Playwright pageError patch skipped: %s", e)
+        if "万" in s:
+            return int(float(s.replace("万", "").replace(",", "").strip()) * 10000)
+        if "亿" in s:
+            return int(float(s.replace("亿", "").replace(",", "").strip()) * 100000000)
+        s = s.replace(",", "")
+        digits = re.sub(r"[^\d.]", "", s)
+        if not digits:
+            return 0
+        return int(float(digits))
+    except (ValueError, TypeError):
+        return 0
 
 
 class XhsClient:
-    """Camoufox-based Xiaohongshu client.
+    """Playwright-Chromium-based Xiaohongshu client.
 
-    Navigates to real pages and extracts data from __INITIAL_STATE__,
-    indistinguishable from a real user browsing.
+    Navigates to real pages and scrapes the rendered DOM, indistinguishable
+    from a real user browsing.
 
-    Can be used as a context manager:
+    Can be used as a context manager::
+
         with XhsClient(cookie_dict) as client:
-            client.start()
-            ...
+            client.search_notes("咖啡")
     """
 
     def __init__(self, cookie_dict: dict):
         self._cookie_dict = cookie_dict
-        self._camoufox_ctx = None
+        self._playwright = None
         self._browser = None
+        self._context = None
         self._page = None
 
     def __enter__(self):
@@ -178,26 +146,37 @@ class XhsClient:
         return str(note_id or "")
 
     def start(self):
-        """Launch camoufox and inject cookies."""
-        from camoufox.sync_api import Camoufox
+        """Launch Chromium, inject cookies, and establish a session."""
+        from playwright.sync_api import sync_playwright
 
-        # Self-heal the Playwright Firefox driver against the location-less
-        # pageError crash before launching (idempotent, best-effort).
-        _ensure_playwright_patched()
+        # Headed by DEFAULT: XHS serves a limited/guest page to headless
+        # automation; only a visible browser gets the real feed. Set
+        # XHS_HEADLESS=1 to force headless (XHS will likely wall it).
+        headless = os.environ.get("XHS_HEADLESS", "").strip().lower() in ("1", "true", "yes")
+        launch_opts: dict = {"headless": headless}
+        if not headless:
+            logger.info("Running Chromium headed (visible window)")
+        proxy = os.environ.get("XHS_PROXY", "").strip()
+        if proxy:
+            # Optional: route the browser through a proxy (e.g. a SOCKS5 tunnel).
+            launch_opts["proxy"] = {"server": proxy}
+            logger.info("Using proxy %s", proxy)
 
-        logger.info("Starting camoufox browser...")
-        self._camoufox_ctx = Camoufox(headless=True)
-        self._browser = self._camoufox_ctx.__enter__()
-        self._page = self._browser.new_page()
+        logger.info("Starting Chromium browser...")
+        self._playwright = sync_playwright().start()
+        self._browser = self._playwright.chromium.launch(**launch_opts)
+        self._context = self._browser.new_context()
+        self._page = self._context.new_page()
 
-        # Inject cookies
+        # Inject cookies before navigation so the session is authenticated.
         cookies = [
             {"name": k, "value": v, "domain": ".xiaohongshu.com", "path": "/"}
             for k, v in self._cookie_dict.items()
         ]
-        self._page.context.add_cookies(cookies)
+        if cookies:
+            self._context.add_cookies(cookies)
 
-        # Navigate to homepage to establish session
+        # Navigate to homepage to establish session.
         self._goto(
             "https://www.xiaohongshu.com",
             timeout=20000,
@@ -208,29 +187,69 @@ class XhsClient:
         logger.info("Browser ready.")
 
     def close(self):
-        """Shut down the browser."""
-        if self._camoufox_ctx:
+        """Shut down the browser and Playwright."""
+        for closer in (
+            lambda: self._page and self._page.close(),
+            lambda: self._context and self._context.close(),
+            lambda: self._browser and self._browser.close(),
+            lambda: self._playwright and self._playwright.stop(),
+        ):
             try:
-                self._camoufox_ctx.__exit__(None, None, None)
+                closer()
             except Exception:
                 pass
-            self._camoufox_ctx = None
-            self._browser = None
-            self._page = None
-            logger.info("Browser closed.")
+        self._page = None
+        self._context = None
+        self._browser = None
+        self._playwright = None
+        logger.info("Browser closed.")
+
+    # ===== Login status =====
+
+    def is_logged_in(self) -> bool:
+        """Lightweight login check via the '我' sidebar channel link.
+
+        Navigates to the homepage (if not already there) and runs the
+        RedNote-MCP login probe. No feed/search load required.
+        """
+        if "xiaohongshu.com" not in (self._page.url or ""):
+            self._goto(
+                "https://www.xiaohongshu.com",
+                timeout=20000,
+                wait_min=1,
+                wait_max=2,
+                context="loading homepage for login check",
+            )
+        # Give the sidebar a moment to render after cookies take effect.
+        try:
+            self._page.wait_for_selector(
+                ".user.side-bar-component .channel",
+                timeout=int(self._effective_timeout(8.0) * 1000),
+            )
+        except Exception:
+            pass
+        try:
+            return bool(self._page.evaluate(LOGIN_CHECK_JS))
+        except Exception:
+            return False
 
     # ===== Search =====
 
-    def search_notes(self, keyword: str) -> list[dict]:
-        """Search notes by keyword.
+    def search_notes(self, keyword: str, limit: int = 10) -> list[dict]:
+        """Search notes by keyword, scraping the rendered DOM.
 
-        Navigates to search_result page and extracts from __INITIAL_STATE__.search.feeds.
+        Opens each result card to read its detail, then re-packs the scraped
+        values into the ``{"id", "xsec_token", "note_card": {...}}`` shape that
+        ``cli.py`` expects.
         """
         import urllib.parse
-        params = urllib.parse.urlencode({"keyword": keyword, "source": "web_explore_feed"})
-        url = f"https://www.xiaohongshu.com/search_result?{params}"
 
-        logger.info("Searching: %s", keyword)
+        url = (
+            "https://www.xiaohongshu.com/search_result?keyword="
+            + urllib.parse.quote(keyword)
+        )
+
+        logger.info("Searching: %s (limit=%d)", keyword, limit)
         self._goto(
             url,
             timeout=20000,
@@ -239,45 +258,111 @@ class XhsClient:
             context="loading search page",
         )
 
-        # Wait for search.feeds to be populated by Vue
-        self._wait_for_data(
-            """() => {
-                const s = window.__INITIAL_STATE__;
-                if (!s || !s.search) return false;
-                const f = s.search.feeds;
-                if (!f) return false;
-                const d = f._rawValue || f._value || f.value || f;
-                return Array.isArray(d) || (d && typeof d === 'object');
-            }""",
-            timeout=15.0,
-            desc="search.feeds",
-            raise_on_timeout=True,
-        )
+        self._wait_for_selector(".feeds-container", desc="search feeds container")
 
-        # Extract search feeds
-        result = self._page.evaluate(
-            """() => {
-"""
-            + UNWRAP_JS
-            + """
-            const s = window.__INITIAL_STATE__;
-            if (!s || !s.search || !s.search.feeds) return null;
-            return unwrap(s.search.feeds, 0);
-        }"""
-        )
+        note_items = self._page.query_selector_all(".feeds-container .note-item")
+        logger.info("Found %d note items", len(note_items))
 
-        if not result:
-            logger.warning("No search results found in __INITIAL_STATE__")
-            return []
+        notes: list[dict] = []
+        count = min(len(note_items), max(0, limit))
+        for i in range(count):
+            logger.info("Processing note %d/%d", i + 1, count)
+            try:
+                # Re-query each iteration: opening/closing the detail dialog can
+                # invalidate previously captured element handles.
+                items = self._page.query_selector_all(".feeds-container .note-item")
+                if i >= len(items):
+                    break
+                item = items[i]
 
-        return result if isinstance(result, list) else []
+                cover = item.query_selector("a.cover.mask.ld")
+                if not cover:
+                    logger.debug("note %d has no cover link, skipping", i + 1)
+                    continue
+
+                # Try to capture the note id + xsec_token from the cover href
+                # before we navigate (the detail URL may not expose the token).
+                href = cover.get_attribute("href") or ""
+                pre_note_id = self._extract_note_id_from_url(href)
+                m = re.search(r"xsec_token=([^&]+)", href)
+                pre_token = m.group(1) if m else ""
+
+                cover.click()
+                self._wait_for_selector("#noteContainer", desc="note detail container")
+                self._human_wait(0.5, 1.5)
+
+                raw = self._page.evaluate(_SEARCH_DETAIL_JS)
+                if raw:
+                    note_id = pre_note_id or self._extract_note_id_from_url(
+                        raw.get("url", "")
+                    )
+                    notes.append(
+                        self._pack_search_card(raw, note_id=note_id, xsec_token=pre_token)
+                    )
+                    logger.info("Extracted note: %s", (raw.get("title") or "")[:30])
+
+                self._human_wait(0.5, 1.0)
+                self._close_note_dialog()
+            except Exception as exc:  # keep going on a single bad card
+                logger.error("Error processing note %d: %s", i + 1, exc)
+                self._close_note_dialog()
+            finally:
+                self._human_wait(0.5, 1.5)
+
+        logger.info("Successfully processed %d notes", len(notes))
+        return notes
+
+    @staticmethod
+    def _pack_search_card(raw: dict, note_id: str, xsec_token: str) -> dict:
+        """Re-pack scraped flat detail into the CLI's search-item shape."""
+        likes = _chinese_unit_to_number(raw.get("likes", ""))
+        collects = _chinese_unit_to_number(raw.get("collects", ""))
+        comments = _chinese_unit_to_number(raw.get("comments", ""))
+        return {
+            "id": note_id,
+            "xsec_token": xsec_token,
+            "xsecToken": xsec_token,
+            "note_card": {
+                "display_title": raw.get("title", "") or "",
+                "displayTitle": raw.get("title", "") or "",
+                "type": raw.get("type", "") or "",
+                "user": {"nickname": raw.get("author", "") or ""},
+                "interact_info": {
+                    "liked_count": likes,
+                    "likedCount": likes,
+                    "collected_count": collects,
+                    "comment_count": comments,
+                },
+                "interactInfo": {
+                    "likedCount": likes,
+                    "collectedCount": collects,
+                    "commentCount": comments,
+                },
+            },
+            "url": raw.get("url", "") or "",
+        }
+
+    def _close_note_dialog(self):
+        """Close an open note-detail dialog and wait for it to detach."""
+        try:
+            close_btn = self._page.query_selector(".close-circle")
+            if close_btn:
+                close_btn.click()
+                self._page.wait_for_selector(
+                    "#noteContainer",
+                    state="detached",
+                    timeout=int(self._effective_timeout(DEFAULT_TIMEOUT_S) * 1000),
+                )
+        except Exception:
+            pass
 
     # ===== Note Detail =====
 
     def get_note_detail(self, note_id: str, xsec_token: str = "") -> dict:
-        """Get note detail by navigating to the explore page.
+        """Get note detail by navigating to the explore page and scraping DOM.
 
-        Extracts from __INITIAL_STATE__.note.noteDetailMap.
+        Returns a dict shaped ``{"note": {...}}`` so ``cli.py``'s
+        ``detail.get("note", detail)`` and downstream key reads keep working.
         """
         url = f"https://www.xiaohongshu.com/explore/{note_id}"
         if xsec_token:
@@ -292,47 +377,58 @@ class XhsClient:
             context=f"loading note {note_id}",
         )
 
-        self._wait_for_data(
-            """() => {
-                const s = window.__INITIAL_STATE__;
-                return s && s.note && s.note.noteDetailMap
-                    && Object.keys(s.note.noteDetailMap).length > 0;
-            }""",
-            timeout=15.0,
-            desc="note.noteDetailMap",
-            raise_on_timeout=True,
-        )
+        self._wait_for_selector(".note-container", desc="note container")
+        try:
+            self._wait_for_selector(".media-container", desc="media container")
+        except DataFetchError:
+            # Text-only notes may lack a media container; don't hard-fail.
+            logger.debug("media-container not found for %s (text-only note?)", note_id)
 
-        # Extract note detail
-        for _attempt in range(3):
-            result = self._page.evaluate("""() => {
-                if (window.__INITIAL_STATE__ &&
-                    window.__INITIAL_STATE__.note &&
-                    window.__INITIAL_STATE__.note.noteDetailMap) {
-                    return JSON.parse(JSON.stringify(
-                        window.__INITIAL_STATE__.note.noteDetailMap
-                    ));
-                }
-                return null;
-            }""")
+        raw = self._page.evaluate(_NOTE_DETAIL_JS)
+        if not raw:
+            raise DataFetchError(f"Failed to extract note detail for {note_id}")
 
-            if result:
-                # Find the note in the map
-                if note_id in result:
-                    return result[note_id]
-                # Try first key if note_id not found
-                if result:
-                    first_key = next(iter(result))
-                    return result[first_key]
+        likes = _chinese_unit_to_number(raw.get("likes", ""))
+        collects = _chinese_unit_to_number(raw.get("collects", ""))
+        comments = _chinese_unit_to_number(raw.get("comments", ""))
 
-            time.sleep(0.5)
-
-        raise DataFetchError(f"Failed to extract note detail for {note_id}")
+        note = {
+            "noteId": note_id,
+            "title": raw.get("title", "") or "",
+            "desc": raw.get("content", "") or "",
+            "type": raw.get("type", "") or "",
+            "ipLocation": raw.get("ipLocation", "") or "",
+            "ip_location": raw.get("ipLocation", "") or "",
+            "tagList": [{"name": t} for t in (raw.get("tags") or [])],
+            "imageList": [{"urlDefault": u} for u in (raw.get("imgs") or [])],
+            "video": {"url": (raw.get("videos") or [""])[0]} if raw.get("videos") else {},
+            "user": {"nickname": raw.get("author", "") or ""},
+            "interactInfo": {
+                "likedCount": likes,
+                "collectedCount": collects,
+                "commentCount": comments,
+                "shareCount": 0,
+                "liked": bool(raw.get("liked", False)),
+                "collected": bool(raw.get("collected", False)),
+            },
+            "interact_info": {
+                "liked_count": likes,
+                "collected_count": collects,
+                "comment_count": comments,
+                "share_count": 0,
+            },
+            "url": url,
+        }
+        return {"note": note}
 
     # ===== User Profile =====
 
     def get_user_info(self, user_id: str) -> dict:
-        """Get user profile by navigating to their profile page."""
+        """Get user profile by scraping their profile page.
+
+        Returns a dict with ``userPageData.basicInfo`` / ``interactions`` so the
+        existing CLI/whoami extraction logic keeps working.
+        """
         url = f"https://www.xiaohongshu.com/user/profile/{user_id}"
 
         logger.info("Loading user profile: %s", user_id)
@@ -344,52 +440,44 @@ class XhsClient:
             context=f"loading user profile {user_id}",
         )
 
-        self._wait_for_data(
-            """() => {
-                const s = window.__INITIAL_STATE__;
-                return s && s.user;
-            }""",
-            timeout=15.0,
-            desc="user (profile)",
-            raise_on_timeout=True,
-        )
+        try:
+            self._wait_for_selector(
+                ".user-info, .user-page, .info-part, .basic-info",
+                desc="user profile info",
+            )
+        except DataFetchError:
+            logger.warning("user profile selectors not found for %s", user_id)
 
-        # Vue wraps values in reactive refs like {_value, dep, ...}
-        # We need to unwrap _value recursively
-        result = self._page.evaluate(
-            """() => {
-"""
-            + UNWRAP_JS
-            + """
-            if (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.user) {
-                const u = window.__INITIAL_STATE__.user;
-                const data = {};
-                // Extract key fields
-                if (u.userPageData) data.userPageData = unwrap(u.userPageData, 0);
-                if (u.notes) data.notes = unwrap(u.notes, 0);
-                if (u.userInfo) data.userInfo = unwrap(u.userInfo, 0);
-                if (Object.keys(data).length === 0) {
-                    return unwrap(u, 0);
-                }
-                return data;
-            }
-            return null;
-        }"""
-        )
-
-        if not result:
+        raw = self._page.evaluate(_USER_PROFILE_JS)
+        if not raw:
             logger.warning(
-                "Failed to extract user profile from __INITIAL_STATE__ for %s; "
-                "returning minimal fallback",
+                "Failed to scrape user profile for %s; returning minimal fallback",
                 user_id,
             )
             return {"userInfo": {"userId": user_id}}
-        return result
+
+        basic = {
+            "userId": user_id,
+            "user_id": user_id,
+            "nickname": raw.get("nickname", "") or "",
+            "redId": raw.get("redId", "") or "",
+            "red_id": raw.get("redId", "") or "",
+            "desc": raw.get("desc", "") or "",
+            "ipLocation": raw.get("ipLocation", "") or "",
+            "gender": raw.get("gender", "") or "",
+        }
+        interactions = raw.get("interactions") or []
+        return {
+            "userPageData": {"basicInfo": basic, "interactions": interactions},
+            "basicInfo": basic,
+            "interactions": interactions,
+            "userInfo": {"userId": user_id, "nickname": basic["nickname"]},
+        }
 
     # ===== Followers / Following =====
 
     def _get_follow_list(self, user_id: str, tab: str) -> list[dict]:
-        """Get a user's followers or following list.
+        """Get a user's followers or following list by scraping the DOM.
 
         Args:
             user_id: The user ID to fetch for.
@@ -404,46 +492,16 @@ class XhsClient:
             wait_max=3,
             context=f"loading {tab} list for user {user_id}",
         )
-        self._wait_for_data(
-            """() => {
-                const s = window.__INITIAL_STATE__;
-                return s && s.user;
-            }""",
-            timeout=15.0,
-            desc="user (follow list)",
-            raise_on_timeout=True,
-        )
+        try:
+            self._wait_for_selector(
+                ".user-list, .follow-list, [class*='user-item']",
+                desc=f"{tab} list",
+            )
+        except DataFetchError:
+            logger.warning("%s list selectors not found for %s", tab, user_id)
+            return []
 
-        result = self._page.evaluate(
-            """(tab) => {
-"""
-            + UNWRAP_JS
-            + """
-            if (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.user) {
-                const u = window.__INITIAL_STATE__.user;
-                // Try tab-specific keys, then generic 'fansUsers' / 'followUsers'
-                const sources = [
-                    u[tab],
-                    tab === 'fans' ? u.fansUsers : u.followUsers,
-                    tab === 'fans' ? u.fans : u.follows,
-                ];
-                for (const src of sources) {
-                    if (src) {
-                        const data = unwrap(src, 0);
-                        if (Array.isArray(data)) return data;
-                        if (data && typeof data === 'object') {
-                            for (const key of ['value', '_value', 'data', 'list', 'users']) {
-                                if (Array.isArray(data[key])) return data[key];
-                            }
-                        }
-                    }
-                }
-            }
-            return [];
-        }""",
-            tab,
-        )
-
+        result = self._page.evaluate(_FOLLOW_LIST_JS)
         return result if isinstance(result, list) else []
 
     def get_followers(self, user_id: str) -> list[dict]:
@@ -457,10 +515,9 @@ class XhsClient:
     # ===== User Posts =====
 
     def get_user_posts(self, user_id: str) -> list[dict]:
-        """Get a user's published notes by navigating to their profile page.
+        """Get a user's published notes by scraping their profile feed.
 
-        Extracts note list from __INITIAL_STATE__.user.notes which contains
-        the first page of the user's published notes.
+        Returns a list of ``{"id", "xsec_token", "note_card": {...}}`` items.
         """
         url = f"https://www.xiaohongshu.com/user/profile/{user_id}"
 
@@ -473,56 +530,24 @@ class XhsClient:
             context=f"loading user posts for {user_id}",
         )
 
-        self._wait_for_data(
-            """() => {
-                const s = window.__INITIAL_STATE__;
-                if (!s || !s.user) return false;
-                const n = s.user.notes;
-                if (!n) return false;
-                const d = n._rawValue || n._value || n.value || n;
-                return Array.isArray(d) || (d && typeof d === 'object');
-            }""",
-            timeout=15.0,
-            desc="user.notes",
-            raise_on_timeout=True,
-        )
+        try:
+            self._wait_for_selector(
+                ".feeds-container, .note-item, .user-posts",
+                desc="user posts feed",
+            )
+        except DataFetchError:
+            logger.warning("user posts feed not found for %s", user_id)
+            return []
 
-        # Extract notes list from user profile state.
-        # Vue wraps arrays in reactive refs, so we unwrap _value recursively.
-        result = self._page.evaluate(
-            """() => {
-"""
-            + UNWRAP_JS
-            + """
-            if (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.user) {
-                const u = window.__INITIAL_STATE__.user;
-                // notes contains the list of user's published notes
-                if (u.notes) {
-                    const notes = unwrap(u.notes, 0);
-                    // notes may be an array directly or wrapped in an object
-                    if (Array.isArray(notes)) return notes;
-                    if (notes && typeof notes === 'object') {
-                        // Try common keys that hold the actual list
-                        for (const key of ['value', '_value', 'data', 'list']) {
-                            if (Array.isArray(notes[key])) return notes[key];
-                        }
-                    }
-                    return notes;
-                }
-            }
-            return null;
-        }"""
-        )
-
+        result = self._page.evaluate(_NOTE_CARDS_JS)
         return result if isinstance(result, list) else []
 
     # ===== Feed (Explore/Recommend) =====
 
     def get_feed(self) -> list[dict]:
-        """Get recommended feed from the explore page.
+        """Get recommended feed from the explore page via DOM scraping.
 
-        Navigates to xiaohongshu.com/explore and extracts the feed items
-        from __INITIAL_STATE__.feed.
+        Returns a list of ``{"id", "xsec_token", "note_card": {...}}`` items.
         """
         logger.info("Loading explore feed...")
         self._goto(
@@ -532,75 +557,33 @@ class XhsClient:
             wait_max=4,
             context="loading explore feed",
         )
-        self._wait_for_data(
-            """() => {
-                const s = window.__INITIAL_STATE__;
-                if (!s) return false;
-                const f = (s.feed && s.feed.feeds) ||
-                          (s.explore && s.explore.feeds) ||
-                          (s.homefeed && s.homefeed.feeds);
-                if (!f) return false;
-                const d = f._rawValue || f._value || f.value || f;
-                return Array.isArray(d) || (d && typeof d === 'object');
-            }""",
-            timeout=15.0,
-            desc="feed.feeds",
-            raise_on_timeout=True,
-        )
-        # Extract feed from explore page state
-        result = self._page.evaluate(
-            """() => {
-"""
-            + UNWRAP_JS
-            + """
-            const state = window.__INITIAL_STATE__;
-            if (!state) return null;
-
-            // Try multiple paths where feed data might live
-            // Path 1: state.feed.feeds (explore page)
-            if (state.feed && state.feed.feeds) {
-                return unwrap(state.feed.feeds, 0);
-            }
-            // Path 2: state.explore.feeds
-            if (state.explore && state.explore.feeds) {
-                return unwrap(state.explore.feeds, 0);
-            }
-            // Path 3: state.homefeed
-            if (state.homefeed && state.homefeed.feeds) {
-                return unwrap(state.homefeed.feeds, 0);
-            }
-            return null;
-        }"""
-        )
-
-        if not result:
-            logger.warning("No feed data found in __INITIAL_STATE__")
+        try:
+            self._wait_for_selector(
+                ".feeds-container, #exploreFeeds, .note-item",
+                desc="feed container",
+            )
+        except DataFetchError:
+            logger.warning("feed container not found")
             return []
 
-        # result could be an array or an object wrapping an array
-        if isinstance(result, list):
-            return result
-        if isinstance(result, dict):
-            for key in ("value", "_value", "data", "list"):
-                if key in result and isinstance(result[key], list):
-                    return result[key]
-        return []
+        result = self._page.evaluate(_NOTE_CARDS_JS)
+        return result if isinstance(result, list) else []
 
     # ===== Topics / Hashtags =====
 
     def search_topics(self, keyword: str) -> list[dict]:
-        """Search for topic/hashtag pages.
+        """Search for topic/hashtag pages by scraping the search results.
 
-        Navigates to the search page with type=topic filter and extracts
-        topic results from __INITIAL_STATE__.
+        Topic DOM structure on XHS is less stable than note cards; this scrapes
+        any visible channel/topic chips and falls back to an empty list.
         """
         import urllib.parse
-        params = urllib.parse.urlencode({
-            "keyword": keyword,
-            "source": "web_explore_feed",
-            "type": "topic",
-        })
-        url = f"https://www.xiaohongshu.com/search_result?{params}"
+
+        url = (
+            "https://www.xiaohongshu.com/search_result?keyword="
+            + urllib.parse.quote(keyword)
+            + "&type=51"  # topic/channel tab
+        )
 
         logger.info("Searching topics: %s", keyword)
         self._goto(
@@ -611,90 +594,30 @@ class XhsClient:
             context="loading topics search page",
         )
 
-        self._wait_for_data(
-            """() => {
-                const s = window.__INITIAL_STATE__;
-                if (!s || !s.search) return false;
-                const t = s.search.topics || s.search.feeds;
-                if (!t) return false;
-                const d = t._rawValue || t._value || t.value || t;
-                return Array.isArray(d) || (d && typeof d === 'object');
-            }""",
-            timeout=15.0,
-            desc="search.topics",
-            raise_on_timeout=True,
-        )
-
-        # Extract topic search results
-        result = self._page.evaluate(
-            """() => {
-"""
-            + UNWRAP_JS
-            + """
-            const state = window.__INITIAL_STATE__;
-            if (!state || !state.search) return null;
-
-            // Topics may be in search.feeds or search.topics
-            const search = state.search;
-            if (search.topics) return unwrap(search.topics, 0);
-            if (search.feeds) return unwrap(search.feeds, 0);
-            return null;
-        }"""
-        )
-
-        if not result:
-            logger.warning("No topic results found")
+        try:
+            self._wait_for_selector(
+                ".feeds-container, .channel-list, [class*='topic']",
+                desc="topics container",
+            )
+        except DataFetchError:
+            logger.warning("topics container not found")
             return []
 
-        if isinstance(result, list):
-            return result
-        if isinstance(result, dict):
-            for key in ("value", "_value", "data", "list"):
-                if key in result and isinstance(result[key], list):
-                    return result[key]
-        return []
+        result = self._page.evaluate(_TOPICS_JS)
+        return result if isinstance(result, list) else []
 
     # ===== Favorites =====
 
     def get_favorites(self, max_count: int = 50) -> list[dict]:
-        """Get current user's favorite (collected) notes.
+        """Get current user's favorite (collected) notes by scraping the DOM.
 
-        Navigates to the user's profile collect tab and extracts notes.
-        Scrolls down to load more notes up to max_count.
-
-        Args:
-            max_count: Maximum number of favorites to return.
+        Navigates to the user's profile collect tab and scrapes note cards,
+        scrolling to load more up to ``max_count``.
         """
-        # First get user_id from self info
-        info = self.get_self_info()
-        user_id = ""
-        if isinstance(info, dict):
-            # Try multiple extraction paths — page structure varies
-            for path_key in ["userInfo", "basicInfo", "basic_info"]:
-                sub = info.get(path_key, {})
-                if isinstance(sub, dict):
-                    uid = sub.get("userId", "") or sub.get("user_id", "")
-                    if uid:
-                        user_id = uid
-                        break
-
-            # Also check userPageData.basicInfo
-            if not user_id:
-                user_page = info.get("userPageData", {})
-                if isinstance(user_page, dict):
-                    basic = user_page.get("basicInfo", user_page.get("basic_info", {}))
-                    if isinstance(basic, dict):
-                        user_id = basic.get("userId", "") or basic.get("user_id", "")
-
-            # Last resort: top-level keys
-            if not user_id:
-                user_id = (info.get("userId", "") or info.get("user_id", "") or
-                           info.get("id", ""))
-
+        user_id = self._resolve_self_user_id()
         if not user_id:
             raise LoginError("Cannot determine user_id. Make sure you are logged in.")
 
-        # Navigate to user's collect tab
         url = f"https://www.xiaohongshu.com/user/profile/{user_id}?tab=collect"
         logger.info("Loading favorites: %s", url)
         self._goto(
@@ -704,96 +627,63 @@ class XhsClient:
             wait_max=3,
             context="loading favorites page",
         )
-        self._wait_for_data(
-            """() => {
-                const s = window.__INITIAL_STATE__;
-                return s && s.user;
-            }""",
-            timeout=15.0,
-            desc="user (favorites)",
-            raise_on_timeout=True,
-        )
-
-        all_notes = []
-        seen_ids = set()
-
-        # Extract notes and scroll to load more
-        page_limit = max(1, (max_count + 9) // 10)
-        for _scroll_attempt in range(page_limit):
-            notes = self._page.evaluate(
-                """() => {
-"""
-                + UNWRAP_JS
-                + """
-                if (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.user) {
-                    const u = window.__INITIAL_STATE__.user;
-                    // Collect tab data is in user.collect or user.collectNotes
-                    const sources = [u.collect, u.collectNotes, u.notes];
-                    for (const src of sources) {
-                        if (src) {
-                            const data = unwrap(src, 0);
-                            if (Array.isArray(data)) return data;
-                            if (data && typeof data === 'object') {
-                                for (const key of ['value', '_value', 'data', 'list']) {
-                                    if (Array.isArray(data[key])) return data[key];
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Fallback: try to scrape visible note cards from DOM
-                const cards = document.querySelectorAll(
-                    'section.note-item, [class*="note-item"], a[href*="/explore/"]'
-                );
-                if (cards.length > 0) {
-                    return Array.from(cards).map(card => {
-                        const link = card.querySelector('a') || card;
-                        const href = link.getAttribute('href') || '';
-                        const title = card.querySelector('[class*="title"]');
-                        const author = card.querySelector('[class*="author"]');
-                        const likes = card.querySelector('[class*="like"]');
-                        return {
-                            noteId: (href.match(/\\/explore\\/([a-zA-Z0-9]+)/) || [])[1] || '',
-                            displayTitle: title ? title.textContent.trim() : '',
-                            user: { nickname: author ? author.textContent.trim() : '' },
-                            interactInfo: { likedCount: likes ? likes.textContent.trim() : '' },
-                            xsecToken: (href.match(/xsec_token=([^&]+)/) || [])[1] || '',
-                        };
-                    });
-                }
-                return [];
-            }"""
+        try:
+            self._wait_for_selector(
+                ".feeds-container, .note-item",
+                desc="favorites feed",
             )
+        except DataFetchError:
+            logger.warning("favorites feed not found")
+            return []
 
-            if isinstance(notes, list):
-                for note in notes:
+        all_notes: list[dict] = []
+        seen_ids: set[str] = set()
+        page_limit = max(1, (max_count + 9) // 10)
+        for _scroll in range(page_limit):
+            cards = self._page.evaluate(_FAVORITES_JS)
+            if isinstance(cards, list):
+                for note in cards:
                     if not isinstance(note, dict):
                         continue
                     nid = note.get("noteId", note.get("note_id", note.get("id", "")))
                     if nid and nid not in seen_ids:
                         seen_ids.add(nid)
                         all_notes.append(note)
-
             if len(all_notes) >= max_count:
                 break
-
-            # Scroll down to load more notes
             self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             self._human_wait(1.5, 2.5)
 
         return all_notes[:max_count]
+
+    def _resolve_self_user_id(self) -> str:
+        """Best-effort: read the logged-in user's id from the sidebar '我' link."""
+        try:
+            uid = self._page.evaluate(
+                """() => {
+                    const a = document.querySelector('.user.side-bar-component .channel');
+                    const link = a && a.closest('a');
+                    const href = (link && link.getAttribute('href')) || '';
+                    const m = href.match(/\\/user\\/profile\\/([a-zA-Z0-9]+)/);
+                    if (m) return m[1];
+                    // Fallback: any profile link on the page
+                    const any = document.querySelector('a[href*="/user/profile/"]');
+                    const h2 = (any && any.getAttribute('href')) || '';
+                    const m2 = h2.match(/\\/user\\/profile\\/([a-zA-Z0-9]+)/);
+                    return m2 ? m2[1] : '';
+                }"""
+            )
+            return str(uid or "")
+        except Exception:
+            return ""
 
     # ===== Self Info =====
 
     def get_self_info(self) -> dict:
         """Get current user's profile info.
 
-        Strategy:
-        1. Navigate to homepage and extract user_id from __INITIAL_STATE__
-           (checks multiple paths: user.currentUser, sidebar, etc.)
-        2. If user_id found, navigate to profile page for full info
-        3. Falls back to whatever data is available from homepage
+        Uses the lightweight login check, resolves the self user_id from the
+        sidebar, then scrapes the full profile page.
         """
         self._goto(
             "https://www.xiaohongshu.com",
@@ -802,130 +692,71 @@ class XhsClient:
             wait_max=2,
             context="loading homepage for self info",
         )
-        self._wait_for_data(
-            """() => {
-                const s = window.__INITIAL_STATE__;
-                if (!s) return false;
-                if (s.user && s.user.userPageData) return true;
-                if (s.user && s.user.currentUser) return true;
-                if (s.user && s.user.userInfo) return true;
-                if (s.sidebar && s.sidebar.user) return true;
-                return false;
-            }""",
-            timeout=10.0,
-            desc="user info",
-            raise_on_timeout=True,
-        )
+        # Wait briefly for the sidebar to render.
+        try:
+            self._page.wait_for_selector(
+                ".user.side-bar-component .channel",
+                timeout=int(self._effective_timeout(10.0) * 1000),
+            )
+        except Exception:
+            pass
 
-        # Try to extract current user info from homepage state.
-        # The data might be in different paths depending on page version.
-        result = self._page.evaluate(
-            """() => {
-"""
-            + UNWRAP_JS
-            + """
-            const state = window.__INITIAL_STATE__;
-            if (!state) return null;
+        logged_in = False
+        try:
+            logged_in = bool(self._page.evaluate(LOGIN_CHECK_JS))
+        except Exception:
+            logged_in = False
 
-            // Try multiple paths where current user info might live
-            const paths = [
-                state.user && state.user.userPageData,
-                state.user && state.user.currentUser,
-                state.user && state.user.info,
-                state.user && state.user.loginUser,
-                state.sidebar && state.sidebar.user,
-                state.app && state.app.user,
-            ];
-
-            for (const p of paths) {
-                if (p) {
-                    const data = unwrap(p, 0);
-                    if (data && typeof data === 'object' && Object.keys(data).length > 0) {
-                        return data;
-                    }
-                }
-            }
-
-            // Last resort: dump the entire user object for inspection
-            if (state.user) {
-                return unwrap(state.user, 0);
-            }
-            return null;
-        }"""
-        )
-
-        if not result:
-            return {}
-
-        # Try to find user_id so we can navigate to profile for full info.
-        user_id = None
-        if isinstance(result, dict):
-            # Check multiple paths where userId might live
-            for sub_key in ["userInfo", "basicInfo", "basic_info"]:
-                sub = result.get(sub_key, {})
-                if isinstance(sub, dict):
-                    uid = sub.get("userId", "") or sub.get("user_id", "")
-                    if uid:
-                        user_id = uid
-                        break
-            if not user_id:
-                user_id = (result.get("userId", "") or result.get("user_id", "") or
-                           result.get("id", ""))
-
-        # If we got a user_id, fetch their full profile page for richer data
+        user_id = self._resolve_self_user_id()
         if user_id:
             try:
-                full_info = self.get_user_info(user_id)
-                if full_info and isinstance(full_info, dict):
-                    return full_info
+                full = self.get_user_info(user_id)
+                if isinstance(full, dict) and full:
+                    return full
             except Exception:
                 pass
 
-        return result
+        if logged_in:
+            # Logged in but couldn't resolve full profile — return a minimal
+            # truthy payload so verification/whoami don't treat this as a guest.
+            return {"userInfo": {"userId": user_id, "guest": False}}
+        return {}
 
-    # ===== Comments via scroll =====
+    # ===== Comments =====
 
     def get_note_comments(self, note_id: str, xsec_token: str = "",
                           max_comments: int = 50) -> list[dict]:
-        """Load comments by scrolling the note page.
+        """Scrape comments from the note page.
 
-        Must be called after get_note_detail on the same note.
+        Returns a list of ``{"userInfo": {"nickname": ...}, "content": ...}``
+        items so ``cli.py``'s comment formatting keeps working.
         """
-        # Ensure we are on the expected note page before extracting comments.
         expected_path = f"/explore/{note_id}"
-        if expected_path not in self._page.url:
+        if expected_path not in (self._page.url or ""):
             self._navigate_to_note(note_id, xsec_token)
 
-        # First get initial comments from __INITIAL_STATE__
-        comments_data = self._page.evaluate("""(noteId) => {
-            if (window.__INITIAL_STATE__ &&
-                window.__INITIAL_STATE__.note &&
-                window.__INITIAL_STATE__.note.noteDetailMap) {
-                const map = window.__INITIAL_STATE__.note.noteDetailMap;
-                const detail = map[noteId] || map[Object.keys(map)[0]];
-                if (detail) {
-                    const comments = detail.comments;
-                    if (comments !== undefined && comments !== null) {
-                        return JSON.parse(JSON.stringify(comments));
-                    }
-                }
-            }
-            return null;
-        }""", note_id)
+        # RedNote-MCP waits on the dialog list; the inline note page uses a
+        # comments list too. Try both, don't hard-fail if absent.
+        for selector in (
+            '[role="dialog"] [role="list"]',
+            ".comments-container",
+            ".comments-el",
+        ):
+            try:
+                self._page.wait_for_selector(
+                    selector,
+                    timeout=int(self._effective_timeout(8.0) * 1000),
+                )
+                break
+            except Exception:
+                continue
 
-        if not comments_data:
+        result = self._page.evaluate(_COMMENTS_JS)
+        if not isinstance(result, list):
             return []
-        if isinstance(comments_data, dict):
-            for key in ("comments", "list", "data", "items"):
-                value = comments_data.get(key)
-                if isinstance(value, list):
-                    comments_data = value
-                    break
-        if not isinstance(comments_data, list):
-            return []
-        if max_comments <= 0:
-            return comments_data
-        return comments_data[:max_comments]
+        if max_comments and max_comments > 0:
+            return result[:max_comments]
+        return result
 
     # ===== Like / Unlike =====
 
@@ -947,18 +778,17 @@ class XhsClient:
         """Unfavorite a note by clicking the collect button."""
         return self._toggle_interact(note_id, xsec_token, "favorite", False)
 
-    # ===== Comment =====
+    # ===== Comment (post) =====
 
     def post_comment(self, note_id: str, content: str, xsec_token: str = "") -> bool:
         """Post a comment on a note by typing into the comment input."""
         self._navigate_to_note(note_id, xsec_token)
-        before_count = self._get_comment_count(note_id)
 
-        # Find and click comment input
         try:
-            input_el = self._page.query_selector('#content-textarea')
-            if not input_el:
-                input_el = self._page.query_selector('[contenteditable="true"]')
+            input_el = (
+                self._page.query_selector("#content-textarea")
+                or self._page.query_selector('[contenteditable="true"]')
+            )
             if not input_el:
                 raise RuntimeError("Comment input not found")
 
@@ -967,78 +797,40 @@ class XhsClient:
             input_el.type(content, delay=random.randint(50, 150))
             self._human_wait(0.5, 1.0)
 
-            # Click submit button
-            submit = self._page.query_selector('.submit.active') or \
-                     self._page.query_selector('button.submit')
+            submit = (
+                self._page.query_selector(".submit.active")
+                or self._page.query_selector("button.submit")
+            )
             if submit:
                 submit.click()
                 self._human_wait(1, 2)
-                if self._verify_comment_submitted(note_id, before_count):
+                if self._verify_comment_submitted(content):
                     logger.info("Comment posted on %s", note_id)
                     return True
 
-            # Try pressing Enter as fallback
             self._page.keyboard.press("Enter")
             self._human_wait(1, 2)
-            if self._verify_comment_submitted(note_id, before_count):
+            if self._verify_comment_submitted(content):
                 logger.info("Comment posted (Enter) on %s", note_id)
                 return True
-            logger.warning("Comment submit attempted but no success signal found for %s", note_id)
+            logger.warning("Comment submit attempted but no success signal for %s", note_id)
             return False
-
         except Exception as e:
             logger.error("Failed to post comment: %s", e)
             return False
 
-    def _get_comment_count(self, note_id: str) -> int:
-        """Best-effort extraction of current comment count for a note."""
-        try:
-            count = self._page.evaluate("""(noteId) => {
-                const s = window.__INITIAL_STATE__;
-                if (!s || !s.note || !s.note.noteDetailMap) return -1;
-                const map = s.note.noteDetailMap;
-                const detail = map[noteId] || map[Object.keys(map)[0]];
-                if (!detail) return -1;
-                const note = detail.note || {};
-                const interactInfo = note.interactInfo || {};
-                const interactInfoSnake = note.interact_info || {};
-                const candidates = [
-                    interactInfo.commentCount,
-                    interactInfoSnake.comment_count,
-                ];
-                for (const c of candidates) {
-                    if (typeof c === 'number') return c;
-                    if (typeof c === 'string' && c.trim()) {
-                        const v = Number(c);
-                        if (!Number.isNaN(v)) return v;
-                    }
-                }
-                const comments = detail.comments;
-                if (Array.isArray(comments)) return comments.length;
-                if (comments && Array.isArray(comments.list)) return comments.list.length;
-                if (comments && Array.isArray(comments.comments)) return comments.comments.length;
-                return -1;
-            }""", note_id)
-            if isinstance(count, (int, float)):
-                return int(count)
-        except Exception:
-            pass
-        return -1
-
-    def _verify_comment_submitted(self, note_id: str, before_count: int) -> bool:
-        """Check whether comment submit succeeded."""
-        # A visible success toast/message is the strongest signal.
+    def _verify_comment_submitted(self, content: str) -> bool:
+        """Check whether comment submit succeeded (toast or comment appeared)."""
         try:
             body_text = (self._page.text_content("body") or "").strip()
         except Exception:
             body_text = ""
         success_tokens = ("评论成功", "发布成功", "发送成功", "success")
-        if body_text and any(token in body_text.lower() for token in success_tokens):
+        lowered = body_text.lower()
+        if body_text and any(token.lower() in lowered for token in success_tokens):
             return True
-
-        # Fallback: comment count increased.
-        after_count = self._get_comment_count(note_id)
-        if before_count >= 0 and after_count >= 0 and after_count > before_count:
+        # The freshly posted comment text usually appears in the comment list.
+        if content and content in body_text:
             return True
         return False
 
@@ -1051,19 +843,12 @@ class XhsClient:
         content: str = "",
         return_detail: bool = False,
     ) -> bool | dict[str, str | bool]:
-        """Publish a new image note on Xiaohongshu.
+        """Publish a new image note on Xiaohongshu (creator platform).
 
-        Navigates to the creator publish page, uploads images via
-        the file input, fills in title and description, then clicks
-        the publish button.
-
-        Args:
-            title: Note title (required).
-            image_paths: List of absolute paths to image files.
-            content: Optional note body/description text.
+        NOTE: Mutation flow not fully re-ported to DOM-only scraping; selector
+        logic is preserved from the original implementation and runs under the
+        new Chromium launch. May need live tweaking.
         """
-        import os
-
         # Validate image paths exist
         for path in image_paths:
             if not os.path.isfile(path):
@@ -1079,7 +864,6 @@ class XhsClient:
             context="loading creator publish page",
         )
 
-        # Creator publishing may require an additional login session.
         for frame in self._page.frames:
             frame_url = (frame.url or "").lower()
             if "creator.xiaohongshu.com/login" in frame_url:
@@ -1088,24 +872,20 @@ class XhsClient:
                     "Please log in at https://creator.xiaohongshu.com first."
                 )
 
-        # Step 1: Upload images via file input.
-        # The creator page has a hidden <input type="file"> for image upload.
         file_input_selectors = [
             'input[type="file"]',
             '[type="file"]',
             'input[accept*="image"]',
             'input[accept*="image/*"]',
-            '.upload-input',
-            '#upload-input',
+            ".upload-input",
+            "#upload-input",
         ]
 
         def _find_file_input():
-            # Search main page first
             for sel in file_input_selectors:
                 el = self._page.query_selector(sel)
                 if el:
                     return el
-            # Then search all iframes (creator console occasionally renders in frame)
             for frame in self._page.frames:
                 for sel in file_input_selectors:
                     try:
@@ -1117,13 +897,10 @@ class XhsClient:
             return None
 
         file_input = None
-        # Wait/retry loop for dynamic mount timing
         for _ in range(6):
             try:
                 self._page.wait_for_selector(
-                    'input[type="file"]',
-                    state="attached",
-                    timeout=2500,
+                    'input[type="file"]', state="attached", timeout=2500
                 )
             except Exception:
                 pass
@@ -1133,12 +910,11 @@ class XhsClient:
             self._human_wait(0.5, 1.2)
 
         if not file_input:
-            # Try clicking the upload area to reveal a file input
             upload_area_selectors = [
-                '.upload-wrapper',
+                ".upload-wrapper",
                 '[class*="upload"]',
-                '.drag-over',
-                '.creator-upload-entry',
+                ".drag-over",
+                ".creator-upload-entry",
             ]
             for sel in upload_area_selectors:
                 area = self._page.query_selector(sel)
@@ -1146,8 +922,6 @@ class XhsClient:
                     area.click()
                     self._human_wait(1, 2)
                     break
-
-            # Try again to find file input
             for _ in range(4):
                 file_input = _find_file_input()
                 if file_input:
@@ -1160,13 +934,10 @@ class XhsClient:
                 "The page structure may have changed."
             )
 
-        # Upload all images at once
         logger.info("Uploading %d images...", len(image_paths))
         file_input.set_input_files(image_paths)
-        # Wait for upload to complete
         self._human_wait(3, 5)
 
-        # Wait a bit more for thumbnails to appear (large files may take longer)
         for _ in range(10):
             thumbnails = self._page.query_selector_all(
                 'img[class*="thumbnail"], img[class*="preview"], '
@@ -1178,16 +949,14 @@ class XhsClient:
 
         logger.info("Images uploaded, filling in details...")
 
-        # Step 2: Fill in title.
         title_selectors = [
-            '#title-textarea',
+            "#title-textarea",
             '[placeholder*="标题"]',
             'input[class*="title"]',
             'textarea[class*="title"]',
-            '.title-input textarea',
-            '.title-input input',
+            ".title-input textarea",
+            ".title-input input",
         ]
-
         for sel in title_selectors:
             title_el = self._page.query_selector(sel)
             if title_el:
@@ -1198,30 +967,26 @@ class XhsClient:
                 break
         else:
             logger.warning("Title input not found, trying keyboard input")
-            # Some pages may focus the title field automatically
             self._page.keyboard.type(title)
 
         self._human_wait(0.5, 1)
 
-        # Step 3: Fill in content/description (optional).
         if content:
             content_selectors = [
-                '#post-textarea',
+                "#post-textarea",
                 '[placeholder*="正文"]',
                 '[placeholder*="描述"]',
                 '[placeholder*="添加描述"]',
                 'textarea[class*="content"]',
                 'textarea[class*="desc"]',
-                '.ql-editor',
+                ".ql-editor",
                 '[contenteditable="true"]',
             ]
-
             for sel in content_selectors:
                 content_el = self._page.query_selector(sel)
                 if content_el:
                     content_el.click()
                     self._human_wait(0.3, 0.5)
-                    # contenteditable divs need keyboard input, not fill
                     tag = content_el.evaluate("el => el.tagName.toLowerCase()")
                     if tag in ("textarea", "input"):
                         content_el.fill(content)
@@ -1234,15 +999,13 @@ class XhsClient:
 
         self._human_wait(1, 2)
 
-        # Step 4: Click publish button.
         publish_selectors = [
             'button:has-text("发布")',
-            '.publishBtn',
+            ".publishBtn",
             '[class*="publish-btn"]',
             'button[class*="submit"]',
-            'button.css-k01sra',
+            "button.css-k01sra",
         ]
-
         for sel in publish_selectors:
             publish_btn = self._page.query_selector(sel)
             if publish_btn:
@@ -1257,14 +1020,13 @@ class XhsClient:
                     or self._extract_note_id_from_page()
                 )
                 if self._is_publish_success(page_text, current_url, note_id):
-                    logger.info("Note published successfully. Current URL: %s", current_url)
+                    logger.info("Note published successfully. URL: %s", current_url)
                     if return_detail:
                         return {"success": True, "note_id": note_id, "url": current_url}
                     return True
 
                 logger.warning(
-                    "Publish button clicked but no success signal found. Current URL: %s",
-                    current_url,
+                    "Publish clicked but no success signal. URL: %s", current_url
                 )
                 if return_detail:
                     return {"success": False, "note_id": note_id, "url": current_url}
@@ -1278,15 +1040,19 @@ class XhsClient:
     # ===== Delete Note =====
 
     def delete_note(self, note_id: str, xsec_token: str = "") -> bool:
-        """Delete a note by opening menu actions on the note page."""
+        """Delete a note by opening menu actions on the note page.
+
+        NOTE: Mutation flow preserved from the original implementation; runs
+        under the new Chromium launch. May need live tweaking.
+        """
         self._navigate_to_note(note_id, xsec_token)
 
         more_selectors = [
             'button:has-text("...")',
             '[aria-label*="更多"]',
             '[class*="more"]',
-            '.more',
-            '.reds-icon.more',
+            ".more",
+            ".reds-icon.more",
         ]
         menu_opened = False
         for sel in more_selectors:
@@ -1308,7 +1074,7 @@ class XhsClient:
         delete_selectors = [
             'button:has-text("删除")',
             '[role="menuitem"]:has-text("删除")',
-            'text=删除',
+            "text=删除",
             '[class*="delete"]',
         ]
         delete_clicked = False
@@ -1332,7 +1098,7 @@ class XhsClient:
             'button:has-text("确定")',
             'button:has-text("确认")',
             'button:has-text("删除")',
-            '.reds-button-primary',
+            ".reds-button-primary",
         ]
         for sel in confirm_selectors:
             el = self._page.query_selector(sel)
@@ -1348,13 +1114,10 @@ class XhsClient:
         page_text = (self._page.text_content("body") or "").strip()
         if "删除成功" in page_text or "已删除" in page_text:
             return True
-
         if "删除失败" in page_text or "操作失败" in page_text:
             return False
-
         if self._verify_note_deleted(note_id, xsec_token):
             return True
-
         return False
 
     def _verify_note_deleted(self, note_id: str, xsec_token: str = "") -> bool:
@@ -1370,28 +1133,20 @@ class XhsClient:
                 wait_max=2,
                 context=f"verifying deletion for note {note_id}",
             )
-            exists = self._page.evaluate("""(targetNoteId) => {
-                const s = window.__INITIAL_STATE__;
-                if (!s || !s.note || !s.note.noteDetailMap) return false;
-                const map = s.note.noteDetailMap;
-                if (!map || Object.keys(map).length === 0) return false;
-                if (map[targetNoteId]) return true;
-                const first = map[Object.keys(map)[0]];
-                return !!(first && first.note);
-            }""", note_id)
-            if exists:
+            # If the note container renders, the note still exists.
+            container = self._page.query_selector(".note-container, #noteContainer")
+            if container:
                 return False
-            body_text = (self._page.text_content("body") or "").strip()
+            body_text = (self._page.text_content("body") or "").strip().lower()
             unavailable_tokens = ("内容不存在", "已删除", "not found", "removed")
-            normalized = body_text.lower()
-            return any(token in normalized for token in unavailable_tokens)
+            return any(token in body_text for token in unavailable_tokens)
         except Exception:
             return False
 
     # ===== Internal: Interaction helpers =====
 
     def _navigate_to_note(self, note_id: str, xsec_token: str = ""):
-        """Navigate to note detail page."""
+        """Navigate to note detail page and wait for it to render."""
         url = f"https://www.xiaohongshu.com/explore/{note_id}"
         if xsec_token:
             url += f"?xsec_token={xsec_token}&xsec_source=pc_feed"
@@ -1402,53 +1157,51 @@ class XhsClient:
             wait_max=3,
             context=f"loading note {note_id}",
         )
-        self._wait_for_data(
-            """() => {
-                const s = window.__INITIAL_STATE__;
-                return s && s.note && s.note.noteDetailMap
-                    && Object.keys(s.note.noteDetailMap).length > 0;
-            }""",
-            timeout=15.0,
-            desc="note (navigate)",
-            raise_on_timeout=True,
+        self._wait_for_selector(
+            ".note-container, #noteContainer", desc="note container"
         )
 
     def _get_interact_state(self, note_id: str) -> dict:
-        """Get like/favorite state from __INITIAL_STATE__."""
-        result = self._page.evaluate("""(noteId) => {
-            if (window.__INITIAL_STATE__ &&
-                window.__INITIAL_STATE__.note &&
-                window.__INITIAL_STATE__.note.noteDetailMap) {
-                const map = window.__INITIAL_STATE__.note.noteDetailMap;
-                const detail = map[noteId] || map[Object.keys(map)[0]];
-                if (detail && detail.note && detail.note.interactInfo) {
-                    return detail.note.interactInfo;
-                }
-            }
-            return null;
-        }""", note_id)
-        return result or {}
+        """Read like/favorite state from the rendered interact bar."""
+        try:
+            state = self._page.evaluate(
+                """() => {
+                    const c = document.querySelector('.interact-container');
+                    if (!c) return null;
+                    const like = c.querySelector('.like-wrapper, .like-lottie');
+                    const collect = c.querySelector('.collect-wrapper, .collect-icon');
+                    const isActive = (el) => {
+                        if (!el) return false;
+                        const cls = (el.className || '') + '';
+                        return /active|liked|collected|selected/i.test(cls);
+                    };
+                    return {
+                        liked: isActive(like),
+                        collected: isActive(collect),
+                    };
+                }"""
+            )
+            return state or {}
+        except Exception:
+            return {}
 
     def _toggle_interact(self, note_id: str, xsec_token: str,
                          action: str, target_state: bool) -> bool:
-        """Toggle like/favorite by clicking the button.
+        """Toggle like/favorite by clicking the button and verifying state.
 
-        Args:
-            action: "like" or "favorite"
-            target_state: True to like/favorite, False to unlike/unfavorite
+        NOTE: Like/favorite state detection on the rendered DOM is heuristic
+        (class-name based); may need live tweaking.
         """
         SELECTORS = {
-            "like": ".interact-container .left .like-lottie",
-            "favorite": ".interact-container .left .reds-icon.collect-icon",
+            "like": ".interact-container .like-wrapper, "
+                    ".interact-container .left .like-lottie",
+            "favorite": ".interact-container .collect-wrapper, "
+                        ".interact-container .left .collect-icon",
         }
-        STATE_KEYS = {
-            "like": "liked",
-            "favorite": "collected",
-        }
+        STATE_KEYS = {"like": "liked", "favorite": "collected"}
 
         self._navigate_to_note(note_id, xsec_token)
 
-        # Check current state
         state = self._get_interact_state(note_id)
         current = state.get(STATE_KEYS[action], False)
         if current == target_state:
@@ -1456,7 +1209,6 @@ class XhsClient:
             logger.info("Note %s already %sd, skipping", note_id, action_name)
             return True
 
-        # Click the button
         selector = SELECTORS[action]
         el = self._page.query_selector(selector)
         if not el:
@@ -1466,14 +1218,11 @@ class XhsClient:
         el.click()
         self._human_wait(2, 3)
 
-        # Verify
         state = self._get_interact_state(note_id)
-        new_state = state.get(STATE_KEYS[action], False)
-        if new_state == target_state:
+        if state.get(STATE_KEYS[action], False) == target_state:
             logger.info("Note %s %s success", note_id, action)
             return True
 
-        # Retry once
         logger.warning("State didn't change, retrying click...")
         el = self._page.query_selector(selector)
         if el:
@@ -1481,8 +1230,7 @@ class XhsClient:
             self._human_wait(2, 3)
 
         state = self._get_interact_state(note_id)
-        final_state = state.get(STATE_KEYS[action], False)
-        if final_state == target_state:
+        if state.get(STATE_KEYS[action], False) == target_state:
             logger.info("Note %s %s success after retry", note_id, action)
             return True
 
@@ -1551,53 +1299,340 @@ class XhsClient:
         if reason:
             raise LoginError(f"Blocked by security verification while {context}: {reason}")
 
-    def _wait_for_initial_state(self, timeout: float = 10.0):
-        """Wait for window.__INITIAL_STATE__ to be populated."""
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                result = self._page.evaluate(
-                    "() => window.__INITIAL_STATE__ !== undefined"
-                )
-                if result:
-                    return
-                self._raise_if_blocked("waiting for initial state", include_body=False)
-            except LoginError:
-                raise
-            except Exception:
-                pass
-            time.sleep(0.3)
-        logger.warning("__INITIAL_STATE__ not found after %.1fs", timeout)
+    def _effective_timeout(self, base: float) -> float:
+        """Scale data-wait timeouts; XHS_TIMEOUT (seconds) overrides the base.
 
-    def _wait_for_data(
-        self,
-        js_condition: str,
-        timeout: float = 15.0,
-        desc: str = "data",
-        raise_on_timeout: bool = False,
-    ):
-        """Wait for a JS condition (returning truthy) to be met.
-
-        Used to wait for Vue to asynchronously populate __INITIAL_STATE__
-        sub-keys after initial page load.
+        Otherwise a configured XHS_PROXY triples the budget (tunnelled
+        connections load slower).
         """
-        start = time.time()
-        while time.time() - start < timeout:
+        env_t = os.environ.get("XHS_TIMEOUT", "").strip()
+        if env_t:
             try:
-                if self._page.evaluate(js_condition):
-                    logger.debug("%s ready after %.1fs", desc, time.time() - start)
-                    return
-                self._raise_if_blocked(f"waiting for {desc}", include_body=False)
-            except LoginError:
-                raise
-            except Exception:
+                return float(env_t)
+            except ValueError:
                 pass
-            time.sleep(0.5)
-        self._raise_if_blocked(f"waiting for {desc}", include_body=True)
-        logger.warning("%s not ready after %.1fs", desc, timeout)
-        if raise_on_timeout:
+        if os.environ.get("XHS_PROXY", "").strip():
+            return base * 3.0
+        return base
+
+    def _wait_for_selector(
+        self,
+        selector: str,
+        *,
+        timeout: float = DEFAULT_TIMEOUT_S,
+        desc: str = "element",
+    ):
+        """Wait for a CSS selector to appear; raise DataFetchError on timeout.
+
+        Checks for risk-control redirects on timeout so a block surfaces as a
+        clear LoginError rather than a generic data error.
+        """
+        timeout = self._effective_timeout(timeout)
+        try:
+            self._page.wait_for_selector(selector, timeout=int(timeout * 1000))
+            logger.debug("%s ready", desc)
+            return
+        except Exception:
+            self._raise_if_blocked(f"waiting for {desc}", include_body=True)
+            logger.warning("%s (%s) not found after %.1fs", desc, selector, timeout)
             raise DataFetchError(f"{desc} not ready after {timeout:.1f}s")
 
     def _human_wait(self, min_sec: float = 1.0, max_sec: float = 3.0):
         """Wait a random human-like interval."""
         time.sleep(random.uniform(min_sec, max_sec))
+
+
+# ===========================================================================
+# In-page scraping scripts (run via page.evaluate). Selectors ported from
+# RedNote-MCP (rednoteTools.ts / noteDetail.ts). Kept as module-level strings
+# for readability and reuse.
+# ===========================================================================
+
+# Read an opened note-detail dialog (search flow). Mirrors rednoteTools.ts.
+_SEARCH_DETAIL_JS = r"""() => {
+    const article = document.querySelector('#noteContainer');
+    if (!article) return null;
+    const txt = (el) => (el && el.textContent ? el.textContent.trim() : '');
+
+    const title = txt(article.querySelector('#detail-title'));
+    const content = txt(article.querySelector('#detail-desc .note-text'));
+    const author = txt(article.querySelector('.author-wrapper .username'));
+
+    const engageBar = document.querySelector('.engage-bar-style');
+    const likes = engageBar ? txt(engageBar.querySelector('.like-wrapper .count')) : '';
+    const collects = engageBar ? txt(engageBar.querySelector('.collect-wrapper .count')) : '';
+    const comments = engageBar ? txt(engageBar.querySelector('.chat-wrapper .count')) : '';
+
+    const isVideo = !!document.querySelector('.media-container video');
+    return {
+        title, content, author,
+        likes, collects, comments,
+        type: isVideo ? 'video' : 'normal',
+        url: window.location.href,
+    };
+}"""
+
+# Full note-detail page. Mirrors noteDetail.ts (GetNoteDetail).
+_NOTE_DETAIL_JS = r"""() => {
+    const article = document.querySelector('.note-container');
+    if (!article) return null;
+    const txt = (el) => (el && el.textContent ? el.textContent.trim() : '');
+
+    const title =
+        txt(article.querySelector('#detail-title')) ||
+        txt(article.querySelector('.title'));
+
+    const scroller = article.querySelector('.note-scroller') || article;
+    const content = txt(scroller.querySelector('.note-content .note-text span'));
+
+    const tags = Array.from(
+        scroller.querySelectorAll('.note-content .note-text a')
+    ).map((a) => (a.textContent || '').trim().replace('#', '')).filter(Boolean);
+
+    const authorEl = article.querySelector('.author-container .info');
+    const author = authorEl ? txt(authorEl.querySelector('.username')) : '';
+
+    const interact = document.querySelector('.interact-container');
+    const likes = interact ? txt(interact.querySelector('.like-wrapper .count')) : '';
+    const collects = interact ? txt(interact.querySelector('.collect-wrapper .count')) : '';
+    const comments = interact ? txt(interact.querySelector('.chat-wrapper .count')) : '';
+
+    const imgs = Array.from(document.querySelectorAll('.media-container img'))
+        .map((img) => img.getAttribute('src') || '').filter(Boolean);
+    const videos = Array.from(document.querySelectorAll('.media-container video'))
+        .map((v) => v.getAttribute('src') || '').filter(Boolean);
+
+    let ipLocation = '';
+    const ipEl = document.querySelector('.bottom-container .date, .date');
+    if (ipEl) {
+        const t = (ipEl.textContent || '').trim();
+        const parts = t.split(/\s+/);
+        if (parts.length > 1) ipLocation = parts[parts.length - 1];
+    }
+
+    return {
+        title, content, tags, author,
+        likes, collects, comments,
+        imgs, videos, ipLocation,
+        type: videos.length ? 'video' : 'normal',
+    };
+}"""
+
+# Scrape note cards from a feed/search/profile grid into the CLI's item shape.
+_NOTE_CARDS_JS = r"""() => {
+    const out = [];
+    const seen = new Set();
+    const cards = document.querySelectorAll('.feeds-container .note-item, section.note-item');
+    cards.forEach((card) => {
+        const txt = (el) => (el && el.textContent ? el.textContent.trim() : '');
+        const link =
+            card.querySelector('a.cover.mask.ld') ||
+            card.querySelector('a[href*="/explore/"]') ||
+            card.querySelector('a');
+        const href = (link && (link.getAttribute('href') || link.href)) || '';
+        const idm = href.match(/\/(?:explore|search_result)\/([a-zA-Z0-9]+)/) ||
+                    href.match(/\/explore\/([a-zA-Z0-9]+)/);
+        const noteId = idm ? idm[1] : '';
+        if (!noteId || seen.has(noteId)) return;
+        seen.add(noteId);
+        const tokenM = href.match(/xsec_token=([^&]+)/);
+        const xsecToken = tokenM ? tokenM[1] : '';
+
+        const title =
+            txt(card.querySelector('.footer .title')) ||
+            txt(card.querySelector('[class*="title"]'));
+        const author =
+            txt(card.querySelector('.author .name')) ||
+            txt(card.querySelector('.card-bottom-wrapper .name')) ||
+            txt(card.querySelector('[class*="author"] [class*="name"]')) ||
+            txt(card.querySelector('[class*="author"]'));
+        const likes =
+            txt(card.querySelector('.like-wrapper .count')) ||
+            txt(card.querySelector('[class*="like"] [class*="count"]')) ||
+            txt(card.querySelector('[class*="like"]'));
+        const isVideo = !!card.querySelector('.play-icon, [class*="video"]');
+
+        out.push({
+            id: noteId,
+            xsec_token: xsecToken,
+            xsecToken: xsecToken,
+            note_card: {
+                display_title: title,
+                displayTitle: title,
+                type: isVideo ? 'video' : 'normal',
+                user: { nickname: author },
+                interact_info: { liked_count: likes, likedCount: likes },
+                interactInfo: { likedCount: likes },
+            },
+        });
+    });
+    return out;
+}"""
+
+# Favorites grid → flat note dicts (cli.py reads noteId/displayTitle/user/interactInfo).
+_FAVORITES_JS = r"""() => {
+    const out = [];
+    const seen = new Set();
+    const cards = document.querySelectorAll('.feeds-container .note-item, section.note-item');
+    cards.forEach((card) => {
+        const txt = (el) => (el && el.textContent ? el.textContent.trim() : '');
+        const link =
+            card.querySelector('a.cover.mask.ld') ||
+            card.querySelector('a[href*="/explore/"]') ||
+            card.querySelector('a');
+        const href = (link && (link.getAttribute('href') || link.href)) || '';
+        const idm = href.match(/\/explore\/([a-zA-Z0-9]+)/);
+        const noteId = idm ? idm[1] : '';
+        if (!noteId || seen.has(noteId)) return;
+        seen.add(noteId);
+        const tokenM = href.match(/xsec_token=([^&]+)/);
+        const title =
+            txt(card.querySelector('.footer .title')) ||
+            txt(card.querySelector('[class*="title"]'));
+        const author =
+            txt(card.querySelector('.author .name')) ||
+            txt(card.querySelector('[class*="author"]'));
+        const likes = txt(card.querySelector('[class*="like"]'));
+        const isVideo = !!card.querySelector('.play-icon, [class*="video"]');
+        out.push({
+            noteId: noteId,
+            note_id: noteId,
+            id: noteId,
+            xsec_token: tokenM ? tokenM[1] : '',
+            xsecToken: tokenM ? tokenM[1] : '',
+            displayTitle: title,
+            display_title: title,
+            title: title,
+            type: isVideo ? 'video' : 'normal',
+            user: { nickname: author },
+            interactInfo: { likedCount: likes },
+            interact_info: { liked_count: likes },
+        });
+    });
+    return out;
+}"""
+
+# Comments → list of {userInfo:{nickname}, content, likeCount, time}.
+_COMMENTS_JS = r"""() => {
+    const out = [];
+    const txt = (el) => (el && el.textContent ? el.textContent.trim() : '');
+    // RedNote-MCP dialog structure first, then inline comment list fallbacks.
+    let items = document.querySelectorAll('[role="dialog"] [role="list"] [role="listitem"]');
+    if (!items.length) {
+        items = document.querySelectorAll('.comments-container .comment-item, .comment-item, .parent-comment');
+    }
+    items.forEach((item) => {
+        const author =
+            txt(item.querySelector('[data-testid="user-name"]')) ||
+            txt(item.querySelector('.author .name')) ||
+            txt(item.querySelector('.name'));
+        const content =
+            txt(item.querySelector('[data-testid="comment-content"]')) ||
+            txt(item.querySelector('.content')) ||
+            txt(item.querySelector('.note-text'));
+        const likes =
+            txt(item.querySelector('[data-testid="likes-count"]')) ||
+            txt(item.querySelector('[class*="like"] .count')) ||
+            txt(item.querySelector('[class*="like"]'));
+        const time =
+            txt(item.querySelector('time')) ||
+            txt(item.querySelector('.date'));
+        if (!content && !author) return;
+        out.push({
+            userInfo: { nickname: author },
+            user_info: { nickname: author },
+            content: content,
+            likeCount: likes,
+            time: time,
+        });
+    });
+    return out;
+}"""
+
+# User profile header → flat fields (cli.py wraps into basicInfo/interactions).
+_USER_PROFILE_JS = r"""() => {
+    const txt = (el) => (el && el.textContent ? el.textContent.trim() : '');
+    const nickname =
+        txt(document.querySelector('.user-info .user-name')) ||
+        txt(document.querySelector('.user-name')) ||
+        txt(document.querySelector('[class*="nickname"]'));
+    let redId = '';
+    const redEl = document.querySelector('.user-redId, [class*="red-id"], .user-content .user-redId');
+    if (redEl) {
+        const t = (redEl.textContent || '').trim();
+        const m = t.match(/[:：]?\s*([0-9A-Za-z_]+)\s*$/);
+        redId = m ? m[1] : t.replace(/[^0-9A-Za-z_]/g, '');
+    }
+    const desc = txt(document.querySelector('.user-desc, [class*="description"]'));
+    let ipLocation = '';
+    const ipEl = document.querySelector('.user-IP, [class*="ip-location"], [class*="ipLocation"]');
+    if (ipEl) {
+        const t = (ipEl.textContent || '').trim();
+        const m = t.match(/[:：]\s*(.+)$/);
+        ipLocation = m ? m[1].trim() : t;
+    }
+
+    const interactions = [];
+    const counts = document.querySelectorAll('.user-interactions .count, .interaction-list .count, [class*="interaction"] .count');
+    const wraps = document.querySelectorAll('.user-interactions > div, .interaction-list > div, [class*="interaction-item"]');
+    wraps.forEach((w) => {
+        const num = txt(w.querySelector('.count'));
+        const label = txt(w.querySelector('.shows, .desc, .label'));
+        if (label) {
+            let key = label;
+            if (/关注/.test(label)) key = 'follows';
+            else if (/粉丝/.test(label)) key = 'fans';
+            else if (/获赞|收藏/.test(label)) key = 'interaction';
+            interactions.push({ type: key, name: key, count: num });
+        }
+    });
+
+    return { nickname, redId, desc, ipLocation, gender: '', interactions };
+}"""
+
+# Follower/following list → list of {nickname, redId, userId}.
+_FOLLOW_LIST_JS = r"""() => {
+    const out = [];
+    const txt = (el) => (el && el.textContent ? el.textContent.trim() : '');
+    const items = document.querySelectorAll(
+        '.user-list .user-item, .follow-list .user-item, [class*="user-item"]'
+    );
+    items.forEach((item) => {
+        const link = item.querySelector('a[href*="/user/profile/"]') || item.querySelector('a');
+        const href = (link && (link.getAttribute('href') || link.href)) || '';
+        const m = href.match(/\/user\/profile\/([a-zA-Z0-9]+)/);
+        const userId = m ? m[1] : '';
+        const nickname =
+            txt(item.querySelector('.name')) ||
+            txt(item.querySelector('[class*="name"]'));
+        if (!nickname && !userId) return;
+        out.push({
+            nickname: nickname,
+            nick_name: nickname,
+            userId: userId,
+            user_id: userId,
+            id: userId,
+            redId: '',
+            red_id: '',
+        });
+    });
+    return out;
+}"""
+
+# Topic/channel chips → list of {name, id, ...}. XHS topic DOM is unstable.
+_TOPICS_JS = r"""() => {
+    const out = [];
+    const txt = (el) => (el && el.textContent ? el.textContent.trim() : '');
+    const items = document.querySelectorAll(
+        '.channel-list a, [class*="topic"] a, .feeds-container .note-item a[href*="page_id"]'
+    );
+    items.forEach((a) => {
+        const name = txt(a);
+        const href = (a.getAttribute('href') || a.href || '');
+        const m = href.match(/page_id=([a-zA-Z0-9]+)/);
+        const id = m ? m[1] : '';
+        if (!name) return;
+        out.push({ name: name, title: name, id: id, topicId: id });
+    });
+    return out;
+}"""

@@ -161,13 +161,19 @@ def login(ctx: click.Context, qrcode: bool, cookie_str: str | None):
         cookie_dict = cookie_str_to_dict(cookie)
         probe_result = _probe_session_usability(cookie_dict)
         if probe_result is False:
-            clear_cookies()
+            # A confirmed QR login should NOT be discarded just because the
+            # usability probe didn't load a feed in time — over a proxied/CN
+            # tunnel that's often just slowness, not a guest/risk page. Keep the
+            # session and tell the user how to retry with a longer budget.
             console.print(
-                "[red]❌ Login completed but session is still limited (guest/risk page). "
-                "Please retry login from a normal residential network.[/red]"
+                "[yellow]⚠️  Login confirmed and cookies saved, but the usability "
+                "probe didn't load a feed in time. Over a proxied link this is "
+                "usually just slowness, not a limited session. Keeping the session — "
+                "retry a command with a longer timeout, e.g.:\n"
+                '   XHS_TIMEOUT=60 xhs search "..."[/yellow]'
             )
-            sys.exit(1)
-        console.print("[green]✅ Login successful! Cookie saved.[/green]")
+        else:
+            console.print("[green]✅ Login successful! Cookie saved.[/green]")
     except Exception as e:
         console.print(f"[red]❌ Login failed: {e}[/red]")
         sys.exit(1)
@@ -218,21 +224,22 @@ def _verify_cookies(cookie_dict: dict) -> bool | None:
 
 
 def _probe_session_usability(cookie_dict: dict) -> bool | None:
-    """Probe whether session can access key data pages (feed/search)."""
+    """Probe whether the session is a confirmed login.
+
+    Uses the lightweight '我' sidebar login check (no feed/search load), so a
+    genuinely logged-in session isn't falsely flagged as "limited" just because
+    a feed didn't render in time.
+    """
     from .client import XhsClient
 
     try:
         with XhsClient(cookie_dict) as client:
-            feeds = client.get_feed()
+            return bool(client.is_logged_in())
     except DataFetchError:
         return False
     except Exception as exc:
         logger.warning("Session usability probe failed due to transient error: %s", exc)
         return None
-
-    if isinstance(feeds, list):
-        return True
-    return False
 
 
 @cli.command()

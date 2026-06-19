@@ -446,13 +446,51 @@ def search(keyword: str, sort: str, as_json: bool):
 
 # ===== Read Note Detail =====
 
+def _resolve_share_link(ref: str) -> tuple[str, str]:
+    """Resolve a note URL / xhslink share link to (note_id, xsec_token).
+
+    A bare/explore/discovery URL is parsed directly; an xhslink short link is
+    followed (HTTP redirect) to the real xiaohongshu.com URL first.
+    """
+    import re
+    import urllib.parse
+
+    url = ref
+    if "xhslink.com" in ref:
+        try:
+            import requests
+            url = requests.get(
+                ref, allow_redirects=True, timeout=15,
+                headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 "
+                         "like Mac OS X) AppleWebKit/605.1.15"},
+            ).url
+        except Exception as exc:
+            logger.warning("share-link resolve failed: %s", exc)
+            return "", ""
+    nid = ""
+    m = re.search(r"/(?:discovery/item|explore|notes?)/([a-zA-Z0-9]+)", url)
+    if m:
+        nid = m.group(1)
+    tok = ""
+    m = re.search(r"[?&]xsec_token=([^&]+)", url)
+    if m:
+        tok = urllib.parse.unquote(m.group(1))
+    return nid, tok
+
+
 @cli.command()
 @click.argument("note_id")
 @click.option("--xsec-token", default="", help="xsec_token from search results")
 @click.option("--comments", is_flag=True, help="Include comments")
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON")
 def read(note_id: str, xsec_token: str, comments: bool, as_json: bool):
-    """Get note detail by ID."""
+    """Get note detail by ID, full URL, or xhslink share link."""
+    # Accept a note URL / xhslink share link, not just a bare ID.
+    if note_id.startswith("http"):
+        rid, rtok = _resolve_share_link(note_id)
+        if rid:
+            note_id = rid
+            xsec_token = xsec_token or rtok
     # Auto-resolve xsec_token from cache if not provided
     if not xsec_token:
         xsec_token = load_xsec_token(note_id)

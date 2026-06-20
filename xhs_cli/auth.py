@@ -270,13 +270,22 @@ def _browser_assisted_qrcode_login() -> str:
                 "https://www.xiaohongshu.com",
                 wait_until="domcontentloaded", timeout=30_000,
             )
-            page.wait_for_selector(".user.side-bar-component .channel", timeout=30_000)
-            channel = page.evaluate(
-                "() => {const e = document.querySelector("
-                "'.user.side-bar-component .channel'); "
-                "return e ? (e.textContent || '').trim() : '';}"
-            )
-            logged_in = channel == "我"
+            # Poll for the logged-in '我' sidebar — it can take a while to
+            # hydrate right after login, so a single short wait was too strict.
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                try:
+                    channel = page.evaluate(
+                        "() => {const e = document.querySelector("
+                        "'.user.side-bar-component .channel'); "
+                        "return e ? (e.textContent || '').trim() : '';}"
+                    )
+                    if channel == "我":
+                        logged_in = True
+                        break
+                except Exception:
+                    pass
+                page.wait_for_timeout(1000)
         except Exception as exc:
             logger.debug("post-login state confirm failed: %s", exc)
         time.sleep(1)

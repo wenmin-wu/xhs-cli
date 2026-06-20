@@ -259,7 +259,26 @@ def _browser_assisted_qrcode_login() -> str:
         completion_response = completion_info.value
         _raise_for_browser_response(completion_response)
         completion_data = _browser_response_payload(completion_response)
-        _wait_for_browser_login_settled(page)
+
+        # RedNote-MCP style: don't trust the QR-status token alone. Drive the
+        # page to the logged-in homepage and CONFIRM the '我' sidebar appears
+        # before harvesting cookies — so the saved web_session is the real
+        # authenticated session, not a pre-login/guest token.
+        logged_in = False
+        try:
+            page.goto(
+                "https://www.xiaohongshu.com",
+                wait_until="domcontentloaded", timeout=30_000,
+            )
+            page.wait_for_selector(".user.side-bar-component .channel", timeout=30_000)
+            channel = page.evaluate(
+                "() => {const e = document.querySelector("
+                "'.user.side-bar-component .channel'); "
+                "return e ? (e.textContent || '').trim() : '';}"
+            )
+            logged_in = channel == "我"
+        except Exception as exc:
+            logger.debug("post-login state confirm failed: %s", exc)
         time.sleep(1)
 
         cookies = _normalize_browser_cookies(page.context.cookies())
@@ -267,17 +286,26 @@ def _browser_assisted_qrcode_login() -> str:
         if not isinstance(login_info, dict):
             login_info = {}
 
+        # Prefer the browser's own (now-authenticated) cookies; fall back to the
+        # QR-status tokens only if the context didn't expose them.
         session = login_info.get("session") or completion_data.get("session")
         secure_session = login_info.get("secure_session") or completion_data.get("secure_session")
-        if isinstance(session, str) and session:
+        if "web_session" not in cookies and isinstance(session, str) and session:
             cookies["web_session"] = session
-        if isinstance(secure_session, str) and secure_session:
+        if "web_session_sec" not in cookies and isinstance(secure_session, str) and secure_session:
             cookies["web_session_sec"] = secure_session
 
         if not _has_required_cookies(cookies):
             raise LoginError(
                 "QR login succeeded, but exported cookies were incomplete: "
                 f"keys={', '.join(sorted(cookies.keys()))}"
+            )
+        if not logged_in:
+            raise LoginError(
+                "QR scan was confirmed, but the page never reached a logged-in "
+                "state (the '我' sidebar did not appear) — the session is still "
+                "guest/limited. Make sure a browser window is actually visible "
+                "(headed) and run `xhs login --qrcode` again."
             )
 
         cookie_str = _dict_to_cookie_str(cookies)

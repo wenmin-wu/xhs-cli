@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import pathlib
 import random
 import re
 import time
@@ -22,6 +23,66 @@ import time
 from .exceptions import DataFetchError, LoginError
 
 logger = logging.getLogger(__name__)
+
+# Persistent browser profile dir — a fixed user-data-dir gives a stable
+# fingerprint plus persistent session/history/localStorage, so the browser
+# looks like a returning real user (and the login naturally persists here).
+PROFILE_DIR = pathlib.Path.home() / ".xhs-cli" / "profile"
+# Cross-process rate guard: each CLI run is a separate process, so we serialize
+# launches via a timestamp file rather than an in-process lock.
+LAST_LAUNCH_FILE = pathlib.Path.home() / ".xhs-cli" / ".last_launch"
+
+# Chromium launch args that strip the most obvious automation markers.
+STEALTH_ARGS = ["--disable-blink-features=AutomationControlled"]
+
+# Init script (runs before any page script) to hide residual webdriver markers.
+STEALTH_INIT_JS = (
+    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});\n"
+    "window.chrome = window.chrome || { runtime: {} };"
+)
+
+
+def _apply_stealth(context) -> None:
+    """Best-effort: install the anti-automation init script on a context.
+
+    Wrapped so a failure here never blocks the browser launch.
+    """
+    try:
+        context.add_init_script(STEALTH_INIT_JS)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Failed to install stealth init script: %s", exc)
+
+
+def _enforce_launch_gap() -> None:
+    """Enforce a minimum gap between browser launches (cross-command).
+
+    Reads/writes a timestamp file; if the previous launch was < XHS_MIN_GAP
+    seconds ago, sleeps the remainder. Best-effort — never crashes on file
+    errors.
+    """
+    try:
+        min_gap = float(os.environ.get("XHS_MIN_GAP", "8").strip() or "8")
+    except (TypeError, ValueError):
+        min_gap = 8.0
+    if min_gap <= 0:
+        return
+    now = time.time()
+    try:
+        last = float(LAST_LAUNCH_FILE.read_text().strip())
+        elapsed = now - last
+        if 0 <= elapsed < min_gap:
+            wait = min_gap - elapsed
+            logger.info("Rate guard: waiting %.1fs before launch (min gap %.0fs)",
+                        wait, min_gap)
+            time.sleep(wait)
+    except Exception:
+        # No prior timestamp / unreadable / unparsable — proceed without waiting.
+        pass
+    try:
+        LAST_LAUNCH_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LAST_LAUNCH_FILE.write_text(str(time.time()))
+    except Exception as exc:
+        logger.debug("Could not write launch timestamp: %s", exc)
 
 # Login-status probe used by RedNote-MCP: the sidebar "我" (Me) channel link is
 # only rendered when logged in.
@@ -168,14 +229,22 @@ class XhsClient:
         return str(note_id or "")
 
     def start(self):
-        """Launch Chromium, inject cookies, and establish a session."""
+        """Launch a persistent Chromium profile, inject cookies, establish session.
+
+        Uses ``launch_persistent_context`` against a fixed user-data-dir so the
+        browser keeps a stable fingerprint plus session/history/localStorage
+        across runs (looks like a returning real user).
+        """
         from playwright.sync_api import sync_playwright
+
+        # Cross-process rate guard before we spin up a browser.
+        _enforce_launch_gap()
 
         # Headed by DEFAULT: XHS serves a limited/guest page to headless
         # automation; only a visible browser gets the real feed. Set
         # XHS_HEADLESS=1 to force headless (XHS will likely wall it).
         headless = os.environ.get("XHS_HEADLESS", "").strip().lower() in ("1", "true", "yes")
-        launch_opts: dict = {"headless": headless}
+        launch_opts: dict = {"headless": headless, "args": list(STEALTH_ARGS)}
         if not headless:
             logger.info("Running Chromium headed (visible window)")
         proxy = os.environ.get("XHS_PROXY", "").strip()
@@ -184,15 +253,26 @@ class XhsClient:
             launch_opts["proxy"] = {"server": proxy}
             logger.info("Using proxy %s", proxy)
 
-        logger.info("Starting Chromium browser...")
+        logger.info("Starting Chromium browser (persistent profile)...")
+        try:
+            PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.debug("Could not create profile dir %s: %s", PROFILE_DIR, exc)
         self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(**launch_opts)
-        self._context = self._browser.new_context()
-        self._page = self._context.new_page()
+        # launch_persistent_context returns a BrowserContext directly (no Browser).
+        self._context = self._playwright.chromium.launch_persistent_context(
+            str(PROFILE_DIR), **launch_opts
+        )
+        # Best-effort: keep a Browser handle for symmetry; persistent contexts
+        # may or may not expose one depending on the launch.
+        self._browser = getattr(self._context, "browser", None)
+        _apply_stealth(self._context)
+        self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
 
         # Inject cookies before navigation so the session is authenticated.
         # Inject for BOTH domains — international (rednote.com) accounts share
         # the session with the cn site (xiaohongshu.com), which redirects there.
+        # The persistent profile keeps these warm across runs too.
         cookies = [
             {"name": k, "value": v, "domain": dom, "path": "/"}
             for dom in (".xiaohongshu.com", ".rednote.com")
@@ -212,11 +292,12 @@ class XhsClient:
         logger.info("Browser ready.")
 
     def close(self):
-        """Shut down the browser and Playwright."""
+        """Shut down the persistent context and Playwright."""
+        # With a persistent context there's no separate Browser to close, and
+        # closing the context tears down its pages — so just close the context
+        # then stop Playwright.
         for closer in (
-            lambda: self._page and self._page.close(),
             lambda: self._context and self._context.close(),
-            lambda: self._browser and self._browser.close(),
             lambda: self._playwright and self._playwright.stop(),
         ):
             try:
@@ -290,6 +371,7 @@ class XhsClient:
             context="loading search page",
         )
 
+        self._human_browse()
         self._wait_for_selector(".feeds-container", desc="search feeds container")
 
         note_items = self._page.query_selector_all(".feeds-container .note-item")
@@ -409,6 +491,7 @@ class XhsClient:
             context=f"loading note {note_id}",
         )
 
+        self._human_browse()
         self._wait_for_selector(".note-container", desc="note container")
         try:
             self._wait_for_selector(".media-container", desc="media container")
@@ -589,6 +672,7 @@ class XhsClient:
             wait_max=4,
             context="loading explore feed",
         )
+        self._human_browse()
         try:
             self._wait_for_selector(
                 ".feeds-container, #exploreFeeds, .note-item",
@@ -1369,9 +1453,28 @@ class XhsClient:
             logger.warning("%s (%s) not found after %.1fs", desc, selector, timeout)
             raise DataFetchError(f"{desc} not ready after {timeout:.1f}s")
 
-    def _human_wait(self, min_sec: float = 1.0, max_sec: float = 3.0):
-        """Wait a random human-like interval."""
+    def _human_wait(self, min_sec: float = 1.0, max_sec: float = 3.5):
+        """Wait a random human-like interval (widened default jitter)."""
         time.sleep(random.uniform(min_sec, max_sec))
+
+    def _human_browse(self):
+        """Mimic a human briefly scrolling the page before scraping.
+
+        Does a few randomized small scrolls with short human pauses between.
+        Best-effort — wrapped so a failure never blocks the scrape.
+        """
+        try:
+            steps = random.randint(2, 4)
+            for _ in range(steps):
+                delta = random.randint(120, 520)
+                try:
+                    self._page.mouse.wheel(0, delta)
+                except Exception:
+                    # Fall back to JS scroll if mouse.wheel is unavailable.
+                    self._page.evaluate("(d) => window.scrollBy(0, d)", delta)
+                self._human_wait(0.4, 1.2)
+        except Exception as exc:
+            logger.debug("human-browse step skipped: %s", exc)
 
 
 # ===========================================================================

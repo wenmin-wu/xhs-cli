@@ -174,14 +174,24 @@ def _browser_assisted_qrcode_login() -> str:
 
     from playwright.sync_api import sync_playwright
 
+    from .client import (
+        PROFILE_DIR,
+        STEALTH_ARGS,
+        _apply_stealth,
+        _enforce_launch_gap,
+    )
+
     print("🔑 Starting QR code login...")
+
+    # Cross-process rate guard before we spin up a browser.
+    _enforce_launch_gap()
 
     # Headed by DEFAULT: XHS serves a limited/guest page to headless automation,
     # so a confirmed QR scan from a headless browser still yields a guest session.
     # Only a visible browser mints a real session. Set XHS_HEADLESS=1 to force
     # headless (not recommended). XHS_PROXY optionally tunnels the traffic.
     _headless = os.environ.get("XHS_HEADLESS", "").strip().lower() in ("1", "true", "yes")
-    launch_opts: dict = {"headless": _headless}
+    launch_opts: dict = {"headless": _headless, "args": list(STEALTH_ARGS)}
     if not _headless:
         logger.info("Login headed (visible window)")
     _proxy = os.environ.get("XHS_PROXY", "").strip()
@@ -189,10 +199,18 @@ def _browser_assisted_qrcode_login() -> str:
         launch_opts["proxy"] = {"server": _proxy}
         logger.info("Login via proxy %s", _proxy)
 
+    try:
+        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.debug("Could not create profile dir %s: %s", PROFILE_DIR, exc)
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(**launch_opts)
-        context = browser.new_context()
-        page = context.new_page()
+        # Persistent profile so the QR login warms (and persists in) the SAME
+        # user-data-dir the data commands reuse — login survives across runs.
+        # launch_persistent_context returns a BrowserContext directly.
+        context = p.chromium.launch_persistent_context(str(PROFILE_DIR), **launch_opts)
+        _apply_stealth(context)
+        page = context.pages[0] if context.pages else context.new_page()
         state = {"last_status": -1}
 
         def _handle_response(response) -> None:
@@ -335,8 +353,9 @@ def _browser_assisted_qrcode_login() -> str:
         cookie_str = _dict_to_cookie_str(cookies)
         save_cookies(cookie_str)
         try:
+            # Persistent context: no separate Browser; closing the context is
+            # the full teardown (the `with sync_playwright()` stops the driver).
             context.close()
-            browser.close()
         except Exception:
             pass
         return cookie_str

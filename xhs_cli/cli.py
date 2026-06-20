@@ -51,6 +51,23 @@ def _setup_logging(verbose: bool):
     )
 
 
+def _guard_mutations():
+    """Refuse mutating actions unless explicitly enabled.
+
+    Auto-publishing/auto-interacting is what triggered the platform's
+    risk-control warning, so mutations are off by default. Set
+    XHS_ALLOW_MUTATIONS=1 to enable.
+    """
+    import os
+
+    if os.environ.get("XHS_ALLOW_MUTATIONS", "").strip().lower() not in ("1", "true", "yes"):
+        console.print(
+            "[red]❌ Mutations are disabled by default to avoid platform "
+            "risk-control. Set XHS_ALLOW_MUTATIONS=1 to enable.[/red]"
+        )
+        sys.exit(1)
+
+
 def _iter_dict_items(items) -> Iterator[dict]:
     """Yield only dict items from a possibly mixed list."""
     if not isinstance(items, list):
@@ -801,6 +818,7 @@ def topics(keyword: str, as_json: bool):
 @click.option("--undo", is_flag=True, help="Unlike instead of like")
 def like(note_id: str, xsec_token: str, undo: bool):
     """Like or unlike a note."""
+    _guard_mutations()
     # Auto-resolve xsec_token from cache if not provided
     if not xsec_token:
         xsec_token = load_xsec_token(note_id)
@@ -827,6 +845,7 @@ def like(note_id: str, xsec_token: str, undo: bool):
 @click.option("--xsec-token", default="", help="xsec_token from search results")
 def unlike(note_id: str, xsec_token: str):
     """Unlike a note."""
+    _guard_mutations()
     if not xsec_token:
         xsec_token = load_xsec_token(note_id)
     try:
@@ -848,6 +867,7 @@ def unlike(note_id: str, xsec_token: str):
 @click.option("--undo", is_flag=True, help="Unfavorite instead of favorite")
 def favorite(note_id: str, xsec_token: str, undo: bool):
     """Favorite or unfavorite a note."""
+    _guard_mutations()
     # Auto-resolve xsec_token from cache if not provided
     if not xsec_token:
         xsec_token = load_xsec_token(note_id)
@@ -874,6 +894,7 @@ def favorite(note_id: str, xsec_token: str, undo: bool):
 @click.option("--xsec-token", default="", help="xsec_token from search results")
 def unfavorite(note_id: str, xsec_token: str):
     """Unfavorite (uncollect) a note."""
+    _guard_mutations()
     if not xsec_token:
         xsec_token = load_xsec_token(note_id)
     try:
@@ -895,6 +916,7 @@ def unfavorite(note_id: str, xsec_token: str):
 @click.option("--xsec-token", default="", help="xsec_token from search results")
 def comment(note_id: str, content: str, xsec_token: str):
     """Post a comment on a note."""
+    _guard_mutations()
     # Auto-resolve xsec_token from cache if not provided
     if not xsec_token:
         xsec_token = load_xsec_token(note_id)
@@ -987,6 +1009,8 @@ def post(title: str, images: tuple[str, ...], content: str, as_json: bool):
     """
     import os
 
+    _guard_mutations()
+
     # Resolve to absolute paths
     abs_paths = [os.path.abspath(p) for p in images]
 
@@ -1045,6 +1069,7 @@ def post(title: str, images: tuple[str, ...], content: str, as_json: bool):
 @click.option("--xsec-token", default="", help="xsec_token from search results")
 def delete(note_id: str, xsec_token: str):
     """Delete a note by note ID."""
+    _guard_mutations()
     if not xsec_token:
         xsec_token = load_xsec_token(note_id)
     try:

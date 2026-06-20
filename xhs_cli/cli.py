@@ -127,22 +127,8 @@ def login(ctx: click.Context, qrcode: bool, cookie_str: str | None):
             cookie_dict = cookie_str_to_dict(cookie)
             verify_result = _verify_cookies(cookie_dict)
             if verify_result is True:
-                probe_result = _probe_session_usability(cookie_dict)
-                if probe_result is True:
-                    console.print("[green]✅ Logged in (from browser cookies)[/green]")
-                    return
-                if probe_result is False:
-                    console.print(
-                        "[yellow]⚠️  Found cookies but session cannot access feed/search. "
-                        "Refreshing login...[/yellow]"
-                    )
-                    clear_cookies()
-                else:
-                    console.print(
-                        "[yellow]⚠️  Cookie verification passed but usability probe "
-                        "is inconclusive. Keeping existing local session.[/yellow]"
-                    )
-                    return
+                console.print("[green]✅ Logged in (from browser cookies)[/green]")
+                return
             elif verify_result is False:
                 console.print("[yellow]⚠️  Found cookies but session is invalid/expired.[/yellow]")
                 # Clear stale cookies so they don't get reused
@@ -154,26 +140,17 @@ def login(ctx: click.Context, qrcode: bool, cookie_str: str | None):
                 )
                 return
 
-    # QR code login
+    # QR code login — RedNote-MCP style: log in on the page, save cookies, done.
+    # No separate post-login probe browser (that step was slow + flaky); the QR
+    # confirmation already proves the login, and the saved cookies are reused by
+    # the next command (search/read).
     console.print("[dim]Falling back to QR code login...[/dim]")
     try:
-        cookie = qrcode_login()
-        cookie_dict = cookie_str_to_dict(cookie)
-        probe_result = _probe_session_usability(cookie_dict)
-        if probe_result is False:
-            # A confirmed QR login should NOT be discarded just because the
-            # usability probe didn't load a feed in time — over a proxied/CN
-            # tunnel that's often just slowness, not a guest/risk page. Keep the
-            # session and tell the user how to retry with a longer budget.
-            console.print(
-                "[yellow]⚠️  Login confirmed and cookies saved, but the usability "
-                "probe didn't load a feed in time. Over a proxied link this is "
-                "usually just slowness, not a limited session. Keeping the session — "
-                "retry a command with a longer timeout, e.g.:\n"
-                '   XHS_TIMEOUT=60 xhs search "..."[/yellow]'
-            )
-        else:
-            console.print("[green]✅ Login successful! Cookie saved.[/green]")
+        qrcode_login()  # logs in via the on-page QR and saves cookies; raises on failure
+        console.print(
+            '[green]✅ Login successful! Cookie saved.[/green] '
+            '[dim]Now run e.g. `xhs search "..."`.[/dim]'
+        )
     except Exception as e:
         console.print(f"[red]❌ Login failed: {e}[/red]")
         sys.exit(1)

@@ -27,7 +27,9 @@ logger = logging.getLogger(__name__)
 # only rendered when logged in.
 LOGIN_CHECK_JS = """() => {
     const el = document.querySelector('.user.side-bar-component .channel');
-    return !!(el && el.textContent && el.textContent.trim() === '我');
+    // Any non-empty channel label ('我' / 'Me' / other locale) = logged in;
+    // the element only renders when authenticated.
+    return !!(el && el.textContent && el.textContent.trim());
 }"""
 
 # Default data/selector timeout in ms (RedNote-MCP uses 30000). Overridable via

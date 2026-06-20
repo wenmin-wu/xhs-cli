@@ -275,12 +275,14 @@ def _browser_assisted_qrcode_login() -> str:
             deadline = time.time() + 60
             while time.time() < deadline:
                 try:
+                    # The user sidebar channel (label '我' / 'Me' / locale text)
+                    # only renders when logged in; any non-empty text = logged in.
                     channel = page.evaluate(
                         "() => {const e = document.querySelector("
                         "'.user.side-bar-component .channel'); "
                         "return e ? (e.textContent || '').trim() : '';}"
                     )
-                    if channel == "我":
+                    if channel:
                         logged_in = True
                         break
                 except Exception:
@@ -312,9 +314,10 @@ def _browser_assisted_qrcode_login() -> str:
         if not logged_in:
             raise LoginError(
                 "QR scan was confirmed, but the page never reached a logged-in "
-                "state (the '我' sidebar did not appear) — the session is still "
-                "guest/limited. Make sure a browser window is actually visible "
-                "(headed) and run `xhs login --qrcode` again."
+                "state (the user sidebar did not appear within 60s) — the session "
+                "may still be guest/limited, or the page was slow. Make sure a "
+                "browser window is actually visible (headed) and run "
+                "`xhs login --qrcode` again."
             )
 
         cookie_str = _dict_to_cookie_str(cookies)

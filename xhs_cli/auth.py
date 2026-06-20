@@ -331,17 +331,26 @@ def _browser_assisted_qrcode_login() -> str:
 
 
 def _normalize_browser_cookies(raw_cookies: list[dict[str, Any]]) -> dict[str, str]:
-    """Convert browser cookies into the local persisted cookie shape."""
+    """Convert browser cookies into the local persisted cookie shape.
+
+    Keeps cookies from BOTH xiaohongshu.com and rednote.com — international
+    accounts redirect to rednote.com and the authenticated ``web_session`` lives
+    there. On a name collision the rednote.com value wins (that's the domain a
+    logged-in international session actually authenticates on).
+    """
+    def _rank(entry: dict[str, Any]) -> int:
+        return 1 if "rednote.com" in str(entry.get("domain", "")) else 0
+
     cookies: dict[str, str] = {}
-    for entry in raw_cookies:
+    for entry in sorted(raw_cookies, key=_rank):  # rednote.com last → it wins
         name = entry.get("name")
         value = entry.get("value")
-        domain = entry.get("domain", "")
+        domain = str(entry.get("domain", ""))
         if not isinstance(name, str) or not isinstance(value, str):
             continue
         if name not in BROWSER_EXPORT_COOKIE_NAMES:
             continue
-        if not isinstance(domain, str) or "xiaohongshu.com" not in domain:
+        if "xiaohongshu.com" not in domain and "rednote.com" not in domain:
             continue
         cookies[name] = value
     return cookies

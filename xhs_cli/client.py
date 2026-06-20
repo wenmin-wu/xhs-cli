@@ -171,8 +171,11 @@ class XhsClient:
         self._page = self._context.new_page()
 
         # Inject cookies before navigation so the session is authenticated.
+        # Inject for BOTH domains — international (rednote.com) accounts share
+        # the session with the cn site (xiaohongshu.com), which redirects there.
         cookies = [
-            {"name": k, "value": v, "domain": ".xiaohongshu.com", "path": "/"}
+            {"name": k, "value": v, "domain": dom, "path": "/"}
+            for dom in (".xiaohongshu.com", ".rednote.com")
             for k, v in self._cookie_dict.items()
         ]
         if cookies:

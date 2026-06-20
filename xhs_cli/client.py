@@ -37,6 +37,26 @@ LOGIN_CHECK_JS = """() => {
 DEFAULT_TIMEOUT_S = 30.0
 
 
+def _xhs_host() -> str:
+    """Base web host for XHS. International accounts authenticate on
+    rednote.com (the cn site xiaohongshu.com stays guest for them). Resolution
+    order: $XHS_DOMAIN → the host auto-saved at login (~/.xhs-cli/domain) →
+    the cn default.
+    """
+    import pathlib
+
+    env = os.environ.get("XHS_DOMAIN", "").strip()
+    if env:
+        return env.replace("https://", "").replace("http://", "").strip("/")
+    try:
+        saved = (pathlib.Path.home() / ".xhs-cli" / "domain").read_text().strip()
+        if saved:
+            return saved
+    except Exception:
+        pass
+    return "www.xiaohongshu.com"
+
+
 def _chinese_unit_to_number(text: str) -> int:
     """Convert a count string like '1.2万' / '3,456' / '赞' into an int.
 
@@ -183,7 +203,7 @@ class XhsClient:
 
         # Navigate to homepage to establish session.
         self._goto(
-            "https://www.xiaohongshu.com",
+            f"https://{_xhs_host()}",
             timeout=20000,
             wait_min=1,
             wait_max=2,
@@ -219,7 +239,7 @@ class XhsClient:
         """
         if "xiaohongshu.com" not in (self._page.url or ""):
             self._goto(
-                "https://www.xiaohongshu.com",
+                f"https://{_xhs_host()}",
                 timeout=20000,
                 wait_min=1,
                 wait_max=2,
@@ -254,7 +274,7 @@ class XhsClient:
         sort_map = {"general": "", "time": "time_descending",
                     "popular": "popularity_descending"}
         url = (
-            "https://www.xiaohongshu.com/search_result?keyword="
+            f"https://{_xhs_host()}/search_result?keyword="
             + urllib.parse.quote(keyword)
         )
         sort_val = sort_map.get(sort, "")
@@ -376,7 +396,7 @@ class XhsClient:
         Returns a dict shaped ``{"note": {...}}`` so ``cli.py``'s
         ``detail.get("note", detail)`` and downstream key reads keep working.
         """
-        url = f"https://www.xiaohongshu.com/explore/{note_id}"
+        url = f"https://{_xhs_host()}/explore/{note_id}"
         if xsec_token:
             url += f"?xsec_token={xsec_token}&xsec_source=pc_feed"
 
@@ -441,7 +461,7 @@ class XhsClient:
         Returns a dict with ``userPageData.basicInfo`` / ``interactions`` so the
         existing CLI/whoami extraction logic keeps working.
         """
-        url = f"https://www.xiaohongshu.com/user/profile/{user_id}"
+        url = f"https://{_xhs_host()}/user/profile/{user_id}"
 
         logger.info("Loading user profile: %s", user_id)
         self._goto(
@@ -495,7 +515,7 @@ class XhsClient:
             user_id: The user ID to fetch for.
             tab: 'fans' for followers, 'follows' for following.
         """
-        url = f"https://www.xiaohongshu.com/user/profile/{user_id}?tab={tab}"
+        url = f"https://{_xhs_host()}/user/profile/{user_id}?tab={tab}"
         logger.info("Loading %s list for user %s", tab, user_id)
         self._goto(
             url,
@@ -531,7 +551,7 @@ class XhsClient:
 
         Returns a list of ``{"id", "xsec_token", "note_card": {...}}`` items.
         """
-        url = f"https://www.xiaohongshu.com/user/profile/{user_id}"
+        url = f"https://{_xhs_host()}/user/profile/{user_id}"
 
         logger.info("Loading user posts: %s", user_id)
         self._goto(
@@ -563,7 +583,7 @@ class XhsClient:
         """
         logger.info("Loading explore feed...")
         self._goto(
-            "https://www.xiaohongshu.com/explore",
+            f"https://{_xhs_host()}/explore",
             timeout=20000,
             wait_min=2,
             wait_max=4,
@@ -592,7 +612,7 @@ class XhsClient:
         import urllib.parse
 
         url = (
-            "https://www.xiaohongshu.com/search_result?keyword="
+            f"https://{_xhs_host()}/search_result?keyword="
             + urllib.parse.quote(keyword)
             + "&type=51"  # topic/channel tab
         )
@@ -630,7 +650,7 @@ class XhsClient:
         if not user_id:
             raise LoginError("Cannot determine user_id. Make sure you are logged in.")
 
-        url = f"https://www.xiaohongshu.com/user/profile/{user_id}?tab=collect"
+        url = f"https://{_xhs_host()}/user/profile/{user_id}?tab=collect"
         logger.info("Loading favorites: %s", url)
         self._goto(
             url,
@@ -698,7 +718,7 @@ class XhsClient:
         sidebar, then scrapes the full profile page.
         """
         self._goto(
-            "https://www.xiaohongshu.com",
+            f"https://{_xhs_host()}",
             timeout=15000,
             wait_min=1,
             wait_max=2,
@@ -1134,7 +1154,7 @@ class XhsClient:
 
     def _verify_note_deleted(self, note_id: str, xsec_token: str = "") -> bool:
         """Re-open the note page and verify the note is no longer available."""
-        url = f"https://www.xiaohongshu.com/explore/{note_id}"
+        url = f"https://{_xhs_host()}/explore/{note_id}"
         if xsec_token:
             url += f"?xsec_token={xsec_token}&xsec_source=pc_feed"
         try:
@@ -1159,7 +1179,7 @@ class XhsClient:
 
     def _navigate_to_note(self, note_id: str, xsec_token: str = ""):
         """Navigate to note detail page and wait for it to render."""
-        url = f"https://www.xiaohongshu.com/explore/{note_id}"
+        url = f"https://{_xhs_host()}/explore/{note_id}"
         if xsec_token:
             url += f"?xsec_token={xsec_token}&xsec_source=pc_feed"
         self._goto(

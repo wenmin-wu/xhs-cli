@@ -292,6 +292,18 @@ def _browser_assisted_qrcode_login() -> str:
             logger.debug("post-login state confirm failed: %s", exc)
         time.sleep(1)
 
+        # Persist the host the logged-in session lives on (international accounts
+        # end up on rednote.com) so search/read navigate to the right domain.
+        if logged_in:
+            try:
+                from urllib.parse import urlparse
+                _host = urlparse(page.url).netloc
+                if _host:
+                    (CONFIG_DIR / "domain").write_text(_host)
+                    logger.info("Saved XHS domain: %s", _host)
+            except Exception as exc:
+                logger.debug("could not save domain: %s", exc)
+
         cookies = _normalize_browser_cookies(page.context.cookies())
         login_info = completion_data.get("login_info", {})
         if not isinstance(login_info, dict):

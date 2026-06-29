@@ -240,6 +240,37 @@ class XhsClient:
         # Cross-process rate guard before we spin up a browser.
         _enforce_launch_gap()
 
+        self._cdp_mode = False
+        # --- CDP mode (default): attach to a persistent chrome-dev browser so the
+        # session is already logged in AND the user can solve any security
+        # verification BY HAND in that same window. Disable with XHS_CDP="" / "off".
+        # See stocks/scripts/start-chrome-dev.sh (CDP on :19327). ---
+        cdp_url = os.environ.get("XHS_CDP", "http://127.0.0.1:19327").strip()
+        if cdp_url.lower() in ("", "off", "none", "0", "false"):
+            cdp_url = ""
+        if cdp_url:
+            try:
+                self._playwright = sync_playwright().start()
+                self._browser = self._playwright.chromium.connect_over_cdp(cdp_url, timeout=5000)
+                self._cdp_mode = True
+                self._context = (self._browser.contexts[0] if self._browser.contexts
+                                 else self._browser.new_context())
+                self._page = self._context.new_page()
+                logger.info("Connected to chrome-dev via CDP %s — using its logged-in "
+                            "session; solve any verification in that window.", cdp_url)
+                return
+            except Exception as exc:
+                logger.info("CDP connect to %s failed (%s) — launching own profile.",
+                            cdp_url, exc)
+                try:
+                    if self._playwright:
+                        self._playwright.stop()
+                except Exception:
+                    pass
+                self._playwright = None
+                self._browser = None
+                self._cdp_mode = False
+
         # Headed by DEFAULT: XHS serves a limited/guest page to headless
         # automation; only a visible browser gets the real feed. Set
         # XHS_HEADLESS=1 to force headless (XHS will likely wall it).
@@ -292,7 +323,23 @@ class XhsClient:
         logger.info("Browser ready.")
 
     def close(self):
-        """Shut down the persistent context and Playwright."""
+        """Shut down the browser session and Playwright."""
+        if getattr(self, "_cdp_mode", False):
+            # Connected to the user's chrome-dev — close ONLY our page, leave the
+            # browser + the user's other tabs running; just disconnect Playwright.
+            try:
+                if self._page:
+                    self._page.close()
+            except Exception:
+                pass
+            try:
+                if self._playwright:
+                    self._playwright.stop()
+            except Exception:
+                pass
+            self._page = self._context = self._browser = self._playwright = None
+            logger.info("Disconnected from chrome-dev (browser left running).")
+            return
         # With a persistent context there's no separate Browser to close, and
         # closing the context tears down its pages — so just close the context
         # then stop Playwright.

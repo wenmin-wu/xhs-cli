@@ -472,12 +472,93 @@ def _resolve_share_link(ref: str) -> tuple[str, str]:
     return nid, tok
 
 
+def _download_images(urls: list[str]) -> list[bytes]:
+    """Fetch carousel image bytes (stdlib only), de-duping identical frames.
+    The rednote CDN needs a browser UA + Referer."""
+    import urllib.request
+    import hashlib
+    hdr = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.xiaohongshu.com/"}
+    out: list[bytes] = []
+    seen: set[str] = set()
+    for u in urls:
+        try:
+            data = urllib.request.urlopen(
+                urllib.request.Request(u, headers=hdr), timeout=30).read()
+        except Exception:
+            continue
+        h = hashlib.md5(data).hexdigest()
+        if h in seen:
+            continue
+        seen.add(h)
+        out.append(data)
+    return out
+
+
+def _ocr_image_bytes(images: list[bytes]) -> str | None:
+    """OCR image bytes → text. Tries in-process RapidOCR, then an external python
+    (env XHS_OCR_PYTHON, then common conda/system pythons) so the CLI's own env
+    stays light. Returns None if no OCR backend is available."""
+    import os
+    import tempfile
+    # 1. In-process (only if this env happens to have rapidocr)
+    try:
+        from rapidocr_onnxruntime import RapidOCR  # type: ignore
+        ocr = RapidOCR()
+        parts = []
+        for b in images:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+                f.write(b)
+                p = f.name
+            try:
+                res, _ = ocr(p)
+                parts.append("\n".join(r[1] for r in res) if res else "")
+            finally:
+                os.unlink(p)
+        return "\n\n".join(parts)
+    except ImportError:
+        pass
+    # 2. Shell out to a python that has rapidocr
+    import subprocess
+    tmpdir = tempfile.mkdtemp(prefix="xhs_ocr_")
+    paths = []
+    for i, b in enumerate(images):
+        p = os.path.join(tmpdir, f"img_{i:02d}.jpg")
+        with open(p, "wb") as f:
+            f.write(b)
+        paths.append(p)
+    script = (
+        "import sys, json\n"
+        "from rapidocr_onnxruntime import RapidOCR\n"
+        "ocr = RapidOCR()\n"
+        "out = []\n"
+        "for p in sys.argv[1:]:\n"
+        "    res, _ = ocr(p)\n"
+        "    out.append('\\n'.join(r[1] for r in res) if res else '')\n"
+        "print(json.dumps(out))\n"
+    )
+    for py in (os.environ.get("XHS_OCR_PYTHON"),
+               os.path.expanduser("~/miniconda3/bin/python"),
+               "/opt/homebrew/bin/python3", "python3"):
+        if not py:
+            continue
+        try:
+            r = subprocess.run([py, "-c", script, *paths],
+                               capture_output=True, text=True, timeout=180)
+            if r.returncode == 0 and r.stdout.strip():
+                return "\n\n".join(json.loads(r.stdout.strip()))
+        except Exception:
+            continue
+    return None
+
+
 @cli.command()
 @click.argument("note_id")
 @click.option("--xsec-token", default="", help="xsec_token from search results")
 @click.option("--comments", is_flag=True, help="Include comments")
 @click.option("--json", "as_json", is_flag=True, help="Output raw JSON")
-def read(note_id: str, xsec_token: str, comments: bool, as_json: bool):
+@click.option("--ocr/--no-ocr", default=True,
+              help="Auto-OCR image notes (text baked into carousel images)")
+def read(note_id: str, xsec_token: str, comments: bool, as_json: bool, ocr: bool):
     """Get note detail by ID, full URL, or xhslink share link."""
     # Accept a note URL / xhslink share link, not just a bare ID.
     if note_id.startswith("http"):
@@ -508,6 +589,29 @@ def read(note_id: str, xsec_token: str, comments: bool, as_json: bool):
             location = note_data.get("ipLocation", note_data.get("ip_location", ""))
             console.print(f"[dim]by {user.get('nickname', '')} · {location}[/dim]")
             console.print(f"\n{note_data.get('desc', '')}")
+
+            # Image notes bake their text into the carousel images and carry an
+            # (almost) empty desc — so a plain `read` looks blank. Detect that and
+            # OCR the images so `read` yields the full text in one command.
+            imgs = [im.get("urlDefault") or im.get("url_default") or im.get("url")
+                    for im in (note_data.get("imageList") or [])]
+            imgs = [u for u in imgs if u]
+            is_image_note = bool(imgs) and len((note_data.get("desc") or "").strip()) < 40
+            if is_image_note and ocr:
+                console.print(f"[dim]📷 image note · {len(imgs)} images — extracting text via OCR…[/dim]")
+                data = _download_images(imgs)
+                text = _ocr_image_bytes(data) if data else None
+                if text and text.strip():
+                    console.print(text)
+                else:
+                    console.print("[yellow]⚠️  OCR backend unavailable.[/yellow] Image URLs:")
+                    for u in imgs:
+                        console.print(f"  {u}")
+                    console.print("[dim]Install rapidocr_onnxruntime, or set XHS_OCR_PYTHON to a "
+                                  "python that has it; or use --json.[/dim]")
+            elif is_image_note:
+                console.print(f"[dim]📷 image note · {len(imgs)} images — text is in the images "
+                              "(rerun without --no-ocr to extract).[/dim]")
             console.print(
                 f"\n❤️  {interact.get('likedCount', interact.get('liked_count', 0))}  "
                 f"⭐ {interact.get('collectedCount', interact.get('collected_count', 0))}  "

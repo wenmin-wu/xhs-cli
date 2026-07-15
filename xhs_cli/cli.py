@@ -560,18 +560,41 @@ def _ocr_image_bytes(images: list[bytes]) -> str | None:
               help="Auto-OCR image notes (text baked into carousel images)")
 def read(note_id: str, xsec_token: str, comments: bool, as_json: bool, ocr: bool):
     """Get note detail by ID, full URL, or xhslink share link."""
-    # Accept a note URL / xhslink share link, not just a bare ID.
+    import re as _re
+    import urllib.parse as _up
+    # An xhslink.com/o/... short link must be resolved IN THE BROWSER (mints a fresh,
+    # valid token — an HTTP-redirect resolve yields a DEAD security-landing token).
+    # A full note URL / bare id is handled directly.
+    share_url = ""
+    xsec_source = "pc_feed"
     if note_id.startswith("http"):
-        rid, rtok = _resolve_share_link(note_id)
-        if rid:
-            note_id = rid
-            xsec_token = xsec_token or rtok
-    # Auto-resolve xsec_token from cache if not provided
-    if not xsec_token:
+        if "xhslink.com" in note_id:
+            share_url = note_id            # resolve in-browser below
+        else:
+            rid, rtok = _resolve_share_link(note_id)
+            if rid:
+                note_id = rid
+                xsec_token = xsec_token or rtok
+    # Auto-resolve xsec_token from cache if not provided (only when we already have an id)
+    if not xsec_token and not share_url:
         xsec_token = load_xsec_token(note_id)
     try:
         with _get_client() as client:
-            detail = client.get_note_detail(note_id, xsec_token)
+            if share_url:
+                resolved = client.resolve_share_link(share_url)
+                m = _re.search(r"/(?:explore|discovery/item|notes?)/([a-zA-Z0-9]+)", resolved)
+                if m:
+                    note_id = m.group(1)
+                mt = _re.search(r"[?&]xsec_token=([^&]+)", resolved)
+                if mt:
+                    xsec_token = _up.unquote(mt.group(1))
+                ms = _re.search(r"[?&]xsec_source=([^&]+)", resolved)
+                if ms:
+                    xsec_source = ms.group(1)
+                if not m:
+                    raise DataFetchError(
+                        f"share link did not resolve to a note URL: {resolved[:120]}")
+            detail = client.get_note_detail(note_id, xsec_token, xsec_source=xsec_source)
 
             output = {"note": detail.get("note", detail)}
 

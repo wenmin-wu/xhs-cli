@@ -519,27 +519,61 @@ class XhsClient:
 
     # ===== Note Detail =====
 
-    def get_note_detail(self, note_id: str, xsec_token: str = "") -> dict:
+    def resolve_share_link(self, share_url: str) -> str:
+        """Navigate the browser to an ``xhslink.com/o/…`` short link so it resolves
+        THROUGH the app_share handshake and mints a **fresh, valid** ``xsec_token``.
+        Returns the resolved full note URL (``location.href``).
+
+        This is the whole trick (user-taught 2026-07-16): a plain HTTP redirect
+        (``requests``) instead yields a token bound to the ``/404/sec_…`` security
+        landing — that token is **DEAD** (any ``explore/<id>?xsec_token=<it>`` bounces
+        to "Sorry, This Page Isn't Available"). Only the real browser handshake mints a
+        usable token.
+        """
+        logger.info("Resolving share link in browser: %s", share_url)
+        self._goto(
+            share_url,
+            timeout=25000,
+            wait_min=2.0,
+            wait_max=3.5,
+            context="resolving share link",
+        )
+        return self._page.url or ""
+
+    def get_note_detail(self, note_id: str, xsec_token: str = "",
+                        xsec_source: str = "pc_feed") -> dict:
         """Get note detail by navigating to the explore page and scraping DOM.
+
+        ``xsec_source`` must match how the token was minted — ``pc_feed`` for a
+        search/feed token, ``app_share`` for a share-link token (a mismatch makes the
+        note-container never render). If the container times out on the saved host, we
+        retry the OTHER domain (rednote.com = logged-in for intl accounts;
+        xiaohongshu.com = cn) before giving up. (2026-07-16.)
 
         Returns a dict shaped ``{"note": {...}}`` so ``cli.py``'s
         ``detail.get("note", detail)`` and downstream key reads keep working.
         """
-        url = f"https://{_xhs_host()}/explore/{note_id}"
-        if xsec_token:
-            url += f"?xsec_token={xsec_token}&xsec_source=pc_feed"
+        def _load(host: str) -> None:
+            url = f"https://{host}/explore/{note_id}"
+            if xsec_token:
+                url += f"?xsec_token={xsec_token}&xsec_source={xsec_source}"
+            logger.info("Loading note: %s (%s)", note_id, host)
+            self._goto(
+                url, timeout=20000, wait_min=1.5, wait_max=3,
+                context=f"loading note {note_id}",
+            )
+            self._human_browse()
+            self._wait_for_selector(".note-container", desc="note container")
 
-        logger.info("Loading note: %s", note_id)
-        self._goto(
-            url,
-            timeout=20000,
-            wait_min=1.5,
-            wait_max=3,
-            context=f"loading note {note_id}",
-        )
+        host = _xhs_host()
+        try:
+            _load(host)
+        except DataFetchError:
+            other = ("www.rednote.com" if "xiaohongshu" in host
+                     else "www.xiaohongshu.com")
+            logger.info("note-container missing on %s — retrying %s", host, other)
+            _load(other)
 
-        self._human_browse()
-        self._wait_for_selector(".note-container", desc="note container")
         try:
             self._wait_for_selector(".media-container", desc="media container")
         except DataFetchError:
@@ -579,7 +613,7 @@ class XhsClient:
                 "comment_count": comments,
                 "share_count": 0,
             },
-            "url": url,
+            "url": (self._page.url or ""),
         }
         return {"note": note}
 

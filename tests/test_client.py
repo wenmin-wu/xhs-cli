@@ -167,3 +167,57 @@ class TestWaitForData:
                 desc="user profile",
                 raise_on_timeout=True,
             )
+
+
+class _CountingGotoPage:
+    """Fake page that counts goto() calls; block-detection is injected separately."""
+
+    def __init__(self):
+        self.url = "https://www.rednote.com/explore/x"
+        self.goto_calls = 0
+
+    def goto(self, *_args, **_kwargs):
+        self.goto_calls += 1
+
+
+class TestGotoSelfHeal:
+    """_goto retries the TRANSIENT security-verification wall (verified 2026-07-20:
+    a logged-in read walled on attempt 1 then a retry cleared it)."""
+
+    def _client(self, monkeypatch, reasons):
+        client = XhsClient({})
+        client._page = _CountingGotoPage()
+        monkeypatch.setattr(client, "_human_wait", lambda *a, **k: None)
+        seq = list(reasons)
+        monkeypatch.setattr(
+            client, "_detect_block_reason",
+            lambda include_body=False: (seq.pop(0) if seq else ""),
+        )
+        return client
+
+    def test_wall_then_clear_self_heals(self, monkeypatch):
+        monkeypatch.setenv("XHS_VERIFY_RETRIES", "3")
+        client = self._client(
+            monkeypatch, ["redirected to verification URL: …/captcha", ""])
+        client._goto("https://x/explore/1")  # must NOT raise
+        assert client._page.goto_calls == 2
+
+    def test_persistent_wall_raises_after_attempts(self, monkeypatch):
+        monkeypatch.setenv("XHS_VERIFY_RETRIES", "3")
+        client = self._client(monkeypatch, ["wall"] * 5)
+        with pytest.raises(LoginError, match="persisted across 3 attempts"):
+            client._goto("https://x/explore/2")
+        assert client._page.goto_calls == 3
+
+    def test_retries_1_disables_self_heal(self, monkeypatch):
+        monkeypatch.setenv("XHS_VERIFY_RETRIES", "1")
+        client = self._client(monkeypatch, ["wall", ""])
+        with pytest.raises(LoginError):
+            client._goto("https://x/explore/3")
+        assert client._page.goto_calls == 1
+
+    def test_happy_path_single_goto(self, monkeypatch):
+        monkeypatch.setenv("XHS_VERIFY_RETRIES", "3")
+        client = self._client(monkeypatch, [""])
+        client._goto("https://x/explore/4")
+        assert client._page.goto_calls == 1

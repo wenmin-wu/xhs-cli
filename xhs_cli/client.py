@@ -1446,10 +1446,51 @@ class XhsClient:
         wait_max: float = 2.0,
         context: str = "loading page",
     ):
-        """Navigate to URL and fail fast if redirected to risk-control pages."""
-        self._page.goto(url, wait_until=wait_until, timeout=timeout)
-        self._human_wait(wait_min, wait_max)
-        self._raise_if_blocked(context, include_body=True)
+        """Navigate to URL, self-healing the TRANSIENT security-verification wall.
+
+        XHS intermittently serves a ``website-login/captcha`` interstitial even while
+        the session is logged in (verified 2026-07-20: a bare ``read <link>`` walled on
+        attempt 1 with CDP up + cookies valid, then a plain retry succeeded). So on a
+        detected wall we simply **re-navigate** a few times before giving up — the wall
+        usually clears. A PERSISTENT wall (a real logout / hard risk-control) exhausts
+        the retries and raises the same ``LoginError`` as before, so callers that truly
+        need a human QR re-login still get told. Tune with ``XHS_VERIFY_RETRIES`` (total
+        attempts, default 3; ``0``/``1`` disables the self-heal).
+        """
+        attempts = self._verify_retries()
+        last_reason = ""
+        for i in range(1, attempts + 1):
+            self._page.goto(url, wait_until=wait_until, timeout=timeout)
+            self._human_wait(wait_min, wait_max)
+            last_reason = self._detect_block_reason(include_body=True)
+            if not last_reason:
+                return
+            if i < attempts:
+                logger.warning(
+                    "security-verification wall while %s (attempt %d/%d): %s — retrying",
+                    context, i, attempts, last_reason,
+                )
+                self._human_wait(2.0, 4.0)  # brief backoff before re-navigating
+        raise LoginError(
+            f"Blocked by security verification while {context}: {last_reason}"
+            + (f" (persisted across {attempts} attempts — session may need a human "
+               "QR re-login)" if attempts > 1 else "")
+        )
+
+    @staticmethod
+    def _verify_retries() -> int:
+        """Total navigation attempts when the transient verification wall fires.
+
+        ``XHS_VERIFY_RETRIES`` overrides; default 3. Clamped to >=1 (1 = no self-heal,
+        old fail-fast behavior).
+        """
+        env_r = os.environ.get("XHS_VERIFY_RETRIES", "").strip()
+        if env_r:
+            try:
+                return max(1, int(env_r))
+            except ValueError:
+                pass
+        return 3
 
     def _detect_block_reason(self, include_body: bool = False) -> str:
         """Detect whether current page is a security verification/risk-control page."""

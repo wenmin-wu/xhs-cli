@@ -251,7 +251,10 @@ class XhsClient:
         if cdp_url:
             try:
                 self._playwright = sync_playwright().start()
-                self._browser = self._playwright.chromium.connect_over_cdp(cdp_url, timeout=5000)
+                # 15s (not 5s): a busy chrome-dev with many tabs can take >5s to attach,
+                # and a timeout falls back to the own-profile path whose bare-homepage warmup
+                # trips the anti-bot captcha (mis-read as "needs QR re-login"). (2026-07-22.)
+                self._browser = self._playwright.chromium.connect_over_cdp(cdp_url, timeout=15000)
                 self._cdp_mode = True
                 self._context = (self._browser.contexts[0] if self._browser.contexts
                                  else self._browser.new_context())
@@ -518,6 +521,58 @@ class XhsClient:
             pass
 
     # ===== Note Detail =====
+
+    def capture_carousel_screenshots(self, expected: int = 0) -> list:
+        """Screenshot every carousel image of the note currently open in the browser and
+        return the PNG bytes (one per slide) — for OCR of image notes.
+
+        Why screenshots and not a download: XHS image CDNs (``*.rednotecdn.com`` /
+        ``sns-img*.xhscdn.com``) **403** a direct HTTP GET (signed-URL / fingerprint) AND
+        block an in-page ``fetch()`` (CORS/CSP). The only path to the pixels is to
+        photograph the already-rendered ``<img>``. We walk the swiper by its pagination
+        count, collecting each unique note-image (``spectrum`` src) as it renders, deduped
+        by src so a wrap-around / UI chrome never double-counts. (2026-07-22.)
+        """
+        page = self._page
+        shots, seen = [], set()
+        try:
+            n = page.evaluate("""() => {
+                const b = document.querySelectorAll('.swiper-pagination-bullet');
+                if (b.length) return b.length;
+                const og = document.querySelectorAll('meta[property="og:image"]');
+                return og.length || 0;
+            }""") or expected or 1
+            n = min(int(n), 20)
+            # scope to the media carousel so page chrome (sidebar/logo) is never captured
+            sel = (".swiper-slide img, .media-container img, .note-slider img, "
+                   "[class*='swiper'] img, [class*='media'] img")
+            for _ in range(n + 1):                     # +1 so the final slide renders
+                page.wait_for_timeout(750)
+                cand = page.query_selector_all(sel) or page.query_selector_all("img")
+                for im in cand:
+                    src = im.get_attribute("src") or ""
+                    if "spectrum" not in src or src in seen:   # note-image only; skip chrome/dupes
+                        continue
+                    box = im.bounding_box()
+                    if not box or box["width"] < 250 or box["height"] < 150:
+                        continue
+                    seen.add(src)
+                    try:
+                        shots.append(im.screenshot())
+                    except Exception:                  # noqa: BLE001 — off-screen / detached
+                        pass
+                nxt = page.query_selector(
+                    ".arrow-controller.right, .swiper-button-next, "
+                    "[class*='arrow'][class*='right']")
+                if nxt is None:
+                    break
+                try:
+                    nxt.click()
+                except Exception:                      # noqa: BLE001 — last slide, arrow inert
+                    break
+        except Exception as exc:                       # noqa: BLE001
+            logger.warning("carousel screenshot capture failed: %s", exc)
+        return shots
 
     def _logged_in_host(self) -> str:
         """The web host THIS browser session is authenticated on. International

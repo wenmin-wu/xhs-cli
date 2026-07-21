@@ -621,10 +621,20 @@ def read(note_id: str, xsec_token: str, comments: bool, as_json: bool, ocr: bool
             imgs = [im.get("urlDefault") or im.get("url_default") or im.get("url")
                     for im in (note_data.get("imageList") or [])]
             imgs = [u for u in imgs if u]
-            is_image_note = bool(imgs) and len((note_data.get("desc") or "").strip()) < 40
+            # Any note WITH images carries text baked into them (research/scan cards) —
+            # not just the empty-desc "pure image note". When --ocr is on we extract it.
+            is_image_note = bool(imgs)
             if is_image_note and ocr:
-                console.print(f"[dim]📷 image note · {len(imgs)} images — extracting text via OCR…[/dim]")
-                data = _download_images(imgs)
+                console.print(f"[dim]📷 {len(imgs)} images — extracting text via OCR…[/dim]")
+                # Screenshot the rendered carousel (CDN 403s a download / blocks in-page
+                # fetch); fall back to a direct download only if screenshots came back empty.
+                data = []
+                try:
+                    data = client.capture_carousel_screenshots(len(imgs))
+                except Exception:  # noqa: BLE001
+                    data = []
+                if not data:
+                    data = _download_images(imgs)
                 text = _ocr_image_bytes(data) if data else None
                 if text and text.strip():
                     console.print(text)

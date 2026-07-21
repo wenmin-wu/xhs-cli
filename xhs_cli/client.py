@@ -519,6 +519,30 @@ class XhsClient:
 
     # ===== Note Detail =====
 
+    def _logged_in_host(self) -> str:
+        """The web host THIS browser session is authenticated on. International
+        accounts log in on **rednote.com** (its cookies carry ``id_token`` /
+        ``web_session``); cn accounts on **xiaohongshu.com**. Detected live from the
+        context cookies so a shared note opens on the domain that will actually serve
+        it (not a guest domain that bounces to a verification wall). Falls back to
+        ``_xhs_host()``. (2026-07-22.)
+        """
+        try:
+            by_dom: dict[str, set] = {}
+            for c in self._context.cookies():
+                by_dom.setdefault(c.get("domain", ""), set()).add(c.get("name", ""))
+            def _auth(dom_suffixes, cookie_names):
+                return any((cookie_names & names)
+                           for d, names in by_dom.items()
+                           if any(d.endswith(s) for s in dom_suffixes))
+            if _auth((".rednote.com", "rednote.com"), {"id_token", "web_session"}):
+                return "www.rednote.com"
+            if _auth((".xiaohongshu.com", "xiaohongshu.com"), {"web_session"}):
+                return "www.xiaohongshu.com"
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("_logged_in_host cookie probe failed: %s", exc)
+        return _xhs_host()
+
     def resolve_share_link(self, share_url: str) -> str:
         """Navigate the browser to an ``xhslink.com/o/…`` short link so it resolves
         THROUGH the app_share handshake and mints a **fresh, valid** ``xsec_token``.
@@ -541,7 +565,7 @@ class XhsClient:
         return self._page.url or ""
 
     def get_note_detail(self, note_id: str, xsec_token: str = "",
-                        xsec_source: str = "pc_feed") -> dict:
+                        xsec_source: str = "pc_feed", resolved_url: str = "") -> dict:
         """Get note detail by navigating to the explore page and scraping DOM.
 
         ``xsec_source`` must match how the token was minted — ``pc_feed`` for a
@@ -550,13 +574,29 @@ class XhsClient:
         retry the OTHER domain (rednote.com = logged-in for intl accounts;
         xiaohongshu.com = cn) before giving up. (2026-07-16.)
 
+        ``resolved_url`` (2026-07-22): when reading a share link, pass the FULL URL that
+        ``resolve_share_link`` already landed on. We then navigate to that URL verbatim
+        with ONLY the domain swapped to the logged-in host — preserving EVERY query param
+        (``xsec_source=app_sh`` / ``share_from_user_*`` / ``xsec_token``). Those params are
+        the share-access GRANT: reconstructing a bare ``/explore/{id}?xsec_token=…`` drops
+        them and the note bounces to a ``website-login/captcha`` verification wall (which we
+        used to mis-report as "needs QR re-login" — it isn't; the account is logged in, the
+        stripped URL just lost its share context). See ``docs/bugs-and-fixes/``.
+
         Returns a dict shaped ``{"note": {...}}`` so ``cli.py``'s
         ``detail.get("note", detail)`` and downstream key reads keep working.
         """
         def _load(host: str) -> None:
-            url = f"https://{host}/explore/{note_id}"
-            if xsec_token:
-                url += f"?xsec_token={xsec_token}&xsec_source={xsec_source}"
+            if resolved_url:
+                # Keep the whole resolved long URL; swap ONLY the domain to `host`.
+                from urllib.parse import urlsplit, urlunsplit
+                parts = urlsplit(resolved_url)
+                url = urlunsplit((parts.scheme or "https", host, parts.path,
+                                  parts.query, ""))
+            else:
+                url = f"https://{host}/explore/{note_id}"
+                if xsec_token:
+                    url += f"?xsec_token={xsec_token}&xsec_source={xsec_source}"
             logger.info("Loading note: %s (%s)", note_id, host)
             self._goto(
                 url, timeout=20000, wait_min=1.5, wait_max=3,
@@ -565,7 +605,9 @@ class XhsClient:
             self._human_browse()
             self._wait_for_selector(".note-container", desc="note container")
 
-        host = _xhs_host()
+        # Prefer the domain THIS session is actually logged in on (rednote.com for intl)
+        # when we have the full share URL — that's where the note renders without a wall.
+        host = self._logged_in_host() if resolved_url else _xhs_host()
         try:
             _load(host)
         except DataFetchError:

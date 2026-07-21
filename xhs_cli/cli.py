@@ -594,7 +594,9 @@ def read(note_id: str, xsec_token: str, comments: bool, as_json: bool, ocr: bool
                 if not m:
                     raise DataFetchError(
                         f"share link did not resolve to a note URL: {resolved[:120]}")
-            detail = client.get_note_detail(note_id, xsec_token, xsec_source=xsec_source)
+            detail = client.get_note_detail(
+                note_id, xsec_token, xsec_source=xsec_source,
+                resolved_url=(resolved if share_url else ""))
 
             output = {"note": detail.get("note", detail)}
 

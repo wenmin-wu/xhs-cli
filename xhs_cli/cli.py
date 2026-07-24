@@ -39,6 +39,9 @@ if TYPE_CHECKING:
     from .client import XhsClient
 
 console = Console()
+# agent-cli-standards: machine output (JSON) -> stdout; human/error text -> stderr.
+# Errors MUST NOT pollute stdout (agents pipe stdout into json parsers).
+err_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
 
 
@@ -169,7 +172,7 @@ def login(ctx: click.Context, qrcode: bool, cookie_str: str | None):
             '[dim]Now run e.g. `xhs search "..."`.[/dim]'
         )
     except Exception as e:
-        console.print(f"[red]❌ Login failed: {e}[/red]")
+        err_console.print(f"[red]❌ Login failed: {e}[/red]")
         sys.exit(1)
 
 
@@ -251,7 +254,7 @@ def status():
     """Check login status (lightweight, no browser needed)."""
     cookie = get_saved_cookie_string()
     if not cookie:
-        console.print("[red]❌ Not logged in. Run `xhs login` to create a saved session.[/red]")
+        err_console.print("[red]❌ Not logged in. Run `xhs login` to create a saved session.[/red]")
         sys.exit(1)
 
     console.print("[green]✅ Logged in[/green] [dim](from saved cookies)[/dim]")
@@ -364,7 +367,7 @@ def whoami(as_json: bool):
     except SystemExit:
         raise
     except Exception as e:
-        console.print(f"[red]❌ Failed to get profile: {e}[/red]")
+        err_console.print(f"[red]❌ Failed to get profile: {e}[/red]")
         sys.exit(1)
 
 
@@ -434,7 +437,7 @@ def search(keyword: str, sort: str, as_json: bool):
             )
 
     except Exception as e:
-        console.print(f"[red]❌ Search failed: {e}[/red]")
+        err_console.print(f"[red]❌ Search failed: {e}[/red]")
         sys.exit(1)
 
 
@@ -687,7 +690,7 @@ def read(note_id: str, xsec_token: str, comments: bool, as_json: bool, ocr: bool
                     )
 
     except Exception as e:
-        console.print(f"[red]❌ Failed to get note: {e}[/red]")
+        err_console.print(f"[red]❌ Failed to get note: {e}[/red]")
         sys.exit(1)
 
 
@@ -708,7 +711,7 @@ def user(user_id: str, as_json: bool):
                 console.print_json(json.dumps(info, ensure_ascii=False))
 
     except Exception as e:
-        console.print(f"[red]❌ Failed to get user: {e}[/red]")
+        err_console.print(f"[red]❌ Failed to get user: {e}[/red]")
         sys.exit(1)
 
 
@@ -773,7 +776,7 @@ def user_posts(user_id: str, as_json: bool):
             console.print("\n[dim]Use `xhs read <Note ID>` to view details[/dim]")
 
     except Exception as e:
-        console.print(f"[red]❌ Failed to get user posts: {e}[/red]")
+        err_console.print(f"[red]❌ Failed to get user posts: {e}[/red]")
         sys.exit(1)
 
 
@@ -811,7 +814,7 @@ def followers(user_id: str, as_json: bool):
             console.print(table)
 
     except Exception as e:
-        console.print(f"[red]❌ Failed to get followers: {e}[/red]")
+        err_console.print(f"[red]❌ Failed to get followers: {e}[/red]")
         sys.exit(1)
 
 
@@ -849,7 +852,7 @@ def following(user_id: str, as_json: bool):
             console.print(table)
 
     except Exception as e:
-        console.print(f"[red]❌ Failed to get following: {e}[/red]")
+        err_console.print(f"[red]❌ Failed to get following: {e}[/red]")
         sys.exit(1)
 
 
@@ -910,7 +913,7 @@ def feed(as_json: bool):
             console.print("\n[dim]Use `xhs read <Note ID>` to view details[/dim]")
 
     except Exception as e:
-        console.print(f"[red]❌ Failed to get feed: {e}[/red]")
+        err_console.print(f"[red]❌ Failed to get feed: {e}[/red]")
         sys.exit(1)
 
 
@@ -963,7 +966,7 @@ def topics(keyword: str, as_json: bool):
             console.print(table)
 
     except Exception as e:
-        console.print(f"[red]❌ Failed to search topics: {e}[/red]")
+        err_console.print(f"[red]❌ Failed to search topics: {e}[/red]")
         sys.exit(1)
 
 
@@ -990,10 +993,10 @@ def like(note_id: str, xsec_token: str, undo: bool):
                 console.print(f"[green]✅ {action} {note_id}[/green]")
             else:
                 action = "Unlike" if undo else "Like"
-                console.print(f"[red]❌ {action} failed for {note_id}[/red]")
+                err_console.print(f"[red]❌ {action} failed for {note_id}[/red]")
                 sys.exit(1)
     except Exception as e:
-        console.print(f"[red]❌ Like failed: {e}[/red]")
+        err_console.print(f"[red]❌ Like failed: {e}[/red]")
         sys.exit(1)
 
 
@@ -1011,10 +1014,10 @@ def unlike(note_id: str, xsec_token: str):
             if ok:
                 console.print(f"[green]✅ Unliked {note_id}[/green]")
             else:
-                console.print(f"[red]❌ Unlike failed for {note_id}[/red]")
+                err_console.print(f"[red]❌ Unlike failed for {note_id}[/red]")
                 sys.exit(1)
     except Exception as e:
-        console.print(f"[red]❌ Unlike failed: {e}[/red]")
+        err_console.print(f"[red]❌ Unlike failed: {e}[/red]")
         sys.exit(1)
 
 
@@ -1039,10 +1042,10 @@ def favorite(note_id: str, xsec_token: str, undo: bool):
                 console.print(f"[green]✅ {action} {note_id}[/green]")
             else:
                 action = "Unfavorite" if undo else "Favorite"
-                console.print(f"[red]❌ {action} failed for {note_id}[/red]")
+                err_console.print(f"[red]❌ {action} failed for {note_id}[/red]")
                 sys.exit(1)
     except Exception as e:
-        console.print(f"[red]❌ Favorite failed: {e}[/red]")
+        err_console.print(f"[red]❌ Favorite failed: {e}[/red]")
         sys.exit(1)
 
 
@@ -1060,10 +1063,10 @@ def unfavorite(note_id: str, xsec_token: str):
             if ok:
                 console.print(f"[green]✅ Unfavorited {note_id}[/green]")
             else:
-                console.print(f"[red]❌ Unfavorite failed for {note_id}[/red]")
+                err_console.print(f"[red]❌ Unfavorite failed for {note_id}[/red]")
                 sys.exit(1)
     except Exception as e:
-        console.print(f"[red]❌ Unfavorite failed: {e}[/red]")
+        err_console.print(f"[red]❌ Unfavorite failed: {e}[/red]")
         sys.exit(1)
 
 
@@ -1083,10 +1086,10 @@ def comment(note_id: str, content: str, xsec_token: str):
             if ok:
                 console.print(f"[green]✅ Comment posted on {note_id}[/green]")
             else:
-                console.print("[red]❌ Comment failed[/red]")
+                err_console.print("[red]❌ Comment failed[/red]")
                 sys.exit(1)
     except Exception as e:
-        console.print(f"[red]❌ Comment failed: {e}[/red]")
+        err_console.print(f"[red]❌ Comment failed: {e}[/red]")
         sys.exit(1)
 
 
@@ -1146,7 +1149,7 @@ def favorites(max_count: int, as_json: bool):
             console.print("\nUse `xhs read <Note ID>` to view details")
 
     except Exception as e:
-        console.print(f"[red]❌ Failed to get favorites: {e}[/red]")
+        err_console.print(f"[red]❌ Failed to get favorites: {e}[/red]")
         sys.exit(1)
 
 
@@ -1211,13 +1214,13 @@ def post(title: str, images: tuple[str, ...], content: str, as_json: bool):
                 else:
                     console.print("[green]✅ Note published successfully![/green]")
             else:
-                console.print("[red]❌ Publish may have failed. Check your profile.[/red]")
+                err_console.print("[red]❌ Publish may have failed. Check your profile.[/red]")
                 sys.exit(1)
     except FileNotFoundError as e:
-        console.print(f"[red]❌ {e}[/red]")
+        err_console.print(f"[red]❌ {e}[/red]")
         sys.exit(1)
     except Exception as e:
-        console.print(f"[red]❌ Publish failed: {e}[/red]")
+        err_console.print(f"[red]❌ Publish failed: {e}[/red]")
         sys.exit(1)
 
 
@@ -1235,10 +1238,10 @@ def delete(note_id: str, xsec_token: str):
             if ok:
                 console.print(f"[green]✅ Deleted {note_id}[/green]")
             else:
-                console.print(f"[red]❌ Delete failed for {note_id}[/red]")
+                err_console.print(f"[red]❌ Delete failed for {note_id}[/red]")
                 sys.exit(1)
     except Exception as e:
-        console.print(f"[red]❌ Delete failed: {e}[/red]")
+        err_console.print(f"[red]❌ Delete failed: {e}[/red]")
         sys.exit(1)
 
 

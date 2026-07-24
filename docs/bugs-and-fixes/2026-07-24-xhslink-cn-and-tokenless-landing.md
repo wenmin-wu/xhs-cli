@@ -33,7 +33,14 @@
 
 - Manual CDP reproduction of the harvest path (before patching) successfully
   scraped the full note (`6a61df0a…a84`).
-- E2E via patched CLI: first attempt after patch hit the
-  `website-login/captcha` **rate-limit wall** (heavy automation that morning) —
-  unrelated to this fix; retried after cool-down. See the E2E log in the
-  stocks-project session notes 2026-07-24.
+- **E2E PASS (2026-07-24 14:1x, after captcha cool-down): all three legs** —
+  ① `xhslink.cn/o/6Gsh12cxSP5` (the original failing link) → full note ✓
+  ② `xhslink.cn/o/1qU2BnDjsz0` → full note (10 imgs) ✓
+  ③ `xhslink.com/o/7iwK6WHltrh` (.com regression) → full note ✓
+- ⚠️ Deployment gotcha found during E2E: `uv tool install --force --from .` REUSES
+  the cached wheel when the version number is unchanged — the first "install" of
+  this fix silently deployed the OLD build. Bump `version` in pyproject.toml (or
+  `--reinstall --no-cache`) for every local install. (0.1.4 → 0.1.5.)
+- Follow-up fix in the same session: all 27 `❌` error prints moved from stdout
+  to stderr (`err_console = Console(stderr=True)`) per agent-cli-standards —
+  verified stdout stays 0 bytes on failure, exit code 1.

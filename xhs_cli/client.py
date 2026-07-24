@@ -619,6 +619,29 @@ class XhsClient:
         )
         return self._page.url or ""
 
+    def harvest_xsec_token(self) -> str:
+        """Pull a fresh ``xsec_token`` out of the CURRENTLY-LOADED page's HTML.
+
+        Used after :meth:`resolve_share_link` when the landing ``location.href``
+        itself carries no token (seen 2026-07-24 with ``xhslink.cn`` links that
+        resolve to ``xiaohongshu.com/discovery/item/<id>?app_platform=…`` — the
+        login-wall page still embeds app_share-minted note links in its HTML).
+        Browser-minted in the SAME handshake, so the token is live, not the dead
+        security-landing kind."""
+        import re as _re
+        import urllib.parse as _up
+        try:
+            html = self._page.content() or ""
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("harvest_xsec_token: page content failed: %s", exc)
+            return ""
+        m = _re.search(r"xsec_token=([A-Za-z0-9_%\-]+={0,2})", html)
+        if not m:
+            return ""
+        tok = _up.unquote(m.group(1))
+        logger.info("Harvested fresh xsec_token from landed page (%d chars)", len(tok))
+        return tok
+
     def get_note_detail(self, note_id: str, xsec_token: str = "",
                         xsec_source: str = "pc_feed", resolved_url: str = "") -> dict:
         """Get note detail by navigating to the explore page and scraping DOM.
@@ -646,7 +669,12 @@ class XhsClient:
                 # Keep the whole resolved long URL; swap ONLY the domain to `host`.
                 from urllib.parse import urlsplit, urlunsplit
                 parts = urlsplit(resolved_url)
-                url = urlunsplit((parts.scheme or "https", host, parts.path,
+                path = parts.path
+                if "/discovery/item/" in path:
+                    # rednote.com does not render .note-container on the
+                    # /discovery/item/ variant — normalize to /explore/ (2026-07-24)
+                    path = f"/explore/{note_id}"
+                url = urlunsplit((parts.scheme or "https", host, path,
                                   parts.query, ""))
             else:
                 url = f"https://{host}/explore/{note_id}"

@@ -440,6 +440,14 @@ def search(keyword: str, sort: str, as_json: bool):
 
 # ===== Read Note Detail =====
 
+
+def _is_short_link(ref: str) -> bool:
+    """xhslink short-share link, ANY TLD — xhslink.com AND xhslink.cn are both live
+    in the wild (2026-07-24: .cn links rejected non-browser UAs and were mis-treated
+    as full note URLs → garbage explore path → container timeout)."""
+    import re
+    return bool(re.search(r"https?://xhslink\.[a-z]+/", ref))
+
 def _resolve_share_link(ref: str) -> tuple[str, str]:
     """Resolve a note URL / xhslink share link to (note_id, xsec_token).
 
@@ -450,7 +458,7 @@ def _resolve_share_link(ref: str) -> tuple[str, str]:
     import urllib.parse
 
     url = ref
-    if "xhslink.com" in ref:
+    if _is_short_link(ref):
         try:
             import requests
             url = requests.get(
@@ -568,7 +576,7 @@ def read(note_id: str, xsec_token: str, comments: bool, as_json: bool, ocr: bool
     share_url = ""
     xsec_source = "pc_feed"
     if note_id.startswith("http"):
-        if "xhslink.com" in note_id:
+        if _is_short_link(note_id):
             share_url = note_id            # resolve in-browser below
         else:
             rid, rtok = _resolve_share_link(note_id)
@@ -594,6 +602,16 @@ def read(note_id: str, xsec_token: str, comments: bool, as_json: bool, ocr: bool
                 if not m:
                     raise DataFetchError(
                         f"share link did not resolve to a note URL: {resolved[:120]}")
+                if not mt:
+                    # location.href landed token-less (xhslink.cn → xiaohongshu.com/
+                    # discovery/item variant). The page HTML still embeds app_share-
+                    # minted links — harvest a fresh token and rebuild the explore URL
+                    # on the logged-in host instead of replaying the token-less path.
+                    tok = client.harvest_xsec_token()
+                    if tok:
+                        xsec_token = tok
+                        xsec_source = "app_share"
+                        resolved = ""
             detail = client.get_note_detail(
                 note_id, xsec_token, xsec_source=xsec_source,
                 resolved_url=(resolved if share_url else ""))

@@ -33,7 +33,7 @@ from .auth import (
     qrcode_login,
     save_token_cache,
 )
-from .exceptions import DataFetchError
+from .exceptions import DataFetchError, LoginError
 
 if TYPE_CHECKING:
     from .client import XhsClient
@@ -451,6 +451,21 @@ def _is_short_link(ref: str) -> bool:
     import re
     return bool(re.search(r"https?://xhslink\.[a-z]+/", ref))
 
+def _http_final_url(ref: str) -> str:
+    """Follow an xhslink short link by plain HTTP redirect; return the final URL
+    VERBATIM (every query param kept) or "" on failure."""
+    try:
+        import requests
+        return requests.get(
+            ref, allow_redirects=True, timeout=15,
+            headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 "
+                     "like Mac OS X) AppleWebKit/605.1.15"},
+        ).url or ""
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("share-link HTTP resolve failed: %s", exc)
+        return ""
+
+
 def _resolve_share_link(ref: str) -> tuple[str, str]:
     """Resolve a note URL / xhslink share link to (note_id, xsec_token).
 
@@ -462,15 +477,8 @@ def _resolve_share_link(ref: str) -> tuple[str, str]:
 
     url = ref
     if _is_short_link(ref):
-        try:
-            import requests
-            url = requests.get(
-                ref, allow_redirects=True, timeout=15,
-                headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 "
-                         "like Mac OS X) AppleWebKit/605.1.15"},
-            ).url
-        except Exception as exc:
-            logger.warning("share-link resolve failed: %s", exc)
+        url = _http_final_url(ref)
+        if not url:
             return "", ""
     nid = ""
     m = re.search(r"/(?:discovery/item|explore|notes?)/([a-zA-Z0-9]+)", url)
@@ -589,10 +597,35 @@ def read(note_id: str, xsec_token: str, comments: bool, as_json: bool, ocr: bool
     # Auto-resolve xsec_token from cache if not provided (only when we already have an id)
     if not xsec_token and not share_url:
         xsec_token = load_xsec_token(note_id)
+    if not xsec_token and not share_url:
+        # 2026-10-07: a token-stripped /discovery/item/<id> walled 3/3 attempts while
+        # the SAME note read fine with its full share URL at the same moment (session
+        # logged in throughout). Say so BEFORE the slow browser retries, not after.
+        err_console.print(
+            f"[yellow]⚠️  no xsec_token for note {note_id} (none in the input, none cached). "
+            "A bare id or a URL with its query stripped is usually walled even when logged "
+            "in — pass the original share link (xhslink…) or the full URL verbatim.[/yellow]")
     try:
         with _get_client() as client:
             if share_url:
-                resolved = client.resolve_share_link(share_url)
+                # 2026-10-07: one in-browser resolve hit Page.goto timeout (25s) and the
+                # whole read died; the identical command succeeded minutes later. Retry
+                # once, then fall back to the HTTP-redirect URL (kept VERBATIM): for an
+                # xhslink.cn link that URL carried a live app_share token that day. The
+                # 07-16 "dead token" finding was on xhslink.com → keep browser first.
+                try:
+                    resolved = client.resolve_share_link(share_url)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("in-browser share-link resolve failed (%s) — retrying once", exc)
+                    try:
+                        resolved = client.resolve_share_link(share_url)
+                    except Exception as exc2:  # noqa: BLE001
+                        resolved = _http_final_url(share_url)
+                        if not resolved:
+                            raise
+                        err_console.print(
+                            f"[yellow]⚠️  in-browser resolve failed twice ({type(exc2).__name__}); "
+                            "falling back to the HTTP-redirect URL (all params kept).[/yellow]")
                 m = _re.search(r"/(?:explore|discovery/item|notes?)/([a-zA-Z0-9]+)", resolved)
                 if m:
                     note_id = m.group(1)
@@ -691,6 +724,14 @@ def read(note_id: str, xsec_token: str, comments: bool, as_json: bool, ocr: bool
 
     except Exception as e:
         err_console.print(f"[red]❌ Failed to get note: {e}[/red]")
+        if isinstance(e, LoginError) and not xsec_token:
+            # The wall message says "may need a human QR re-login"; with no token
+            # that is the wrong lead. Name the actual missing input. Exit 3 = bad input.
+            err_console.print(
+                "[yellow]Cause: no xsec_token was supplied for this note — most likely NOT a "
+                "logout (check `xhs status`). Retry with the original share link or the full "
+                "URL including xsec_token=… exactly as shared.[/yellow]")
+            sys.exit(3)
         sys.exit(1)
 
 

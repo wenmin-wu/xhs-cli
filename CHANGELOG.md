@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Fixed (0.1.6, 2026-10-07)
+
+- **`read`: a missing `xsec_token` is named as the cause.** A bare id or a
+  token-stripped `/discovery/item/<id>` now warns up front, and a verification
+  wall without a token exits **3** with `Cause: no xsec_token…` instead of the
+  misleading "may need a human QR re-login" (measured: the stripped URL walled
+  3/3 while the full share URL read fine, session logged in).
+- **`read <xhslink>`: one in-browser resolve timeout no longer kills the read.**
+  Retries once, then falls back to the HTTP-redirect URL passed on verbatim.
+
 ### Changed
 
 - **Switched the browser backend from camoufox to Playwright Chromium and
